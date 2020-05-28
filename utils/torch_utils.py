@@ -12,10 +12,10 @@ import torch.nn.functional as F
 def init_seeds(seed=0):
     torch.manual_seed(seed)
 
-    # Remove randomness (may be slower on Tesla GPUs) # https://pytorch.org/docs/stable/notes/randomness.html
+    # Reduce randomness (may be slower on Tesla GPUs) # https://pytorch.org/docs/stable/notes/randomness.html
     if seed == 0:
-        cudnn.deterministic = True
-        cudnn.benchmark = False
+        cudnn.deterministic = False
+        cudnn.benchmark = True
 
 
 def select_device(device='', apex=False, batch_size=None):
@@ -48,6 +48,23 @@ def select_device(device='', apex=False, batch_size=None):
 def time_synchronized():
     torch.cuda.synchronize() if torch.cuda.is_available() else None
     return time.time()
+
+
+def initialize_weights(model):
+    for m in model.modules():
+        t = type(m)
+        if t is nn.Conv2d:
+            pass  # nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+        elif t is nn.BatchNorm2d:
+            m.eps = 1e-4
+            m.momentum = 0.03
+        elif t in [nn.LeakyReLU, nn.ReLU, nn.ReLU6]:
+            m.inplace = True
+
+
+def find_modules(model, mclass=nn.Conv2d):
+    # finds layer indices matching module class 'mclass'
+    return [i for i, m in enumerate(model.module_list) if isinstance(m, mclass)]
 
 
 def fuse_conv_and_bn(conv, bn):
@@ -90,7 +107,7 @@ def model_info(model, verbose=False):
 
     try:  # FLOPS
         from thop import profile
-        macs, _ = profile(model, inputs=(torch.zeros(1, 3, 640, 640),))
+        macs, _ = profile(model, inputs=(torch.zeros(1, 3, 480, 640),), verbose=False)
         fs = ', %.1f GFLOPS' % (macs / 1E9 * 2)
     except:
         fs = ''
@@ -115,14 +132,15 @@ def load_classifier(name='resnet101', n=2):
     return model
 
 
-def scale_img(img, r=1.0):  # img(16,3,256,416), r=ratio
-    # scales a batch of pytorch images while retaining same input shape (cropped or grey-padded)
+def scale_img(img, ratio=1.0, same_shape=True):  # img(16,3,256,416), r=ratio
+    # scales img(bs,3,y,x) by ratio
     h, w = img.shape[2:]
-    s = (int(h * r), int(w * r))  # new size
-    p = h - s[0], w - s[1]  # pad/crop pixels
+    s = (int(h * ratio), int(w * ratio))  # new size
     img = F.interpolate(img, size=s, mode='bilinear', align_corners=False)  # resize
-    return F.pad(img, [0, p[1], 0, p[0]], value=0.5) if r < 1.0 else img[:, :, :p[0], :p[1]]  # pad/crop
-    # cv2.imwrite('scaled.jpg', np.array(img[0].permute((1, 2, 0)) * 255.0))
+    if not same_shape:  # pad/crop img
+        gs = 64  # (pixels) grid size
+        h, w = [math.ceil(x * ratio / gs) * gs for x in (h, w)]
+    return F.pad(img, [0, w - s[1], 0, h - s[0]], value=0.447)  # value = imagenet mean
 
 
 class ModelEMA:
@@ -148,7 +166,7 @@ class ModelEMA:
         self.ema = deepcopy(model)
         self.ema.eval()
         self.updates = 0  # number of EMA updates
-        self.decay = lambda x: decay * (1 - math.exp(-x / 1000))  # decay exponential ramp (to help early epochs)
+        self.decay = lambda x: decay * (1 - math.exp(-x / 2000))  # decay exponential ramp (to help early epochs)
         self.device = device  # perform ema on different device from model if set
         if device:
             self.ema.to(device=device)

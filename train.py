@@ -3,6 +3,7 @@ import argparse
 import torch.distributed as dist
 import torch.optim as optim
 import torch.optim.lr_scheduler as lr_scheduler
+from torch.utils.tensorboard import SummaryWriter
 
 import test  # import test.py to get mAP after each epoch
 from models import *
@@ -13,6 +14,7 @@ mixed_precision = True
 try:  # Mixed precision training https://github.com/NVIDIA/apex
     from apex import amp
 except:
+    print('Apex recommended for faster mixed precision training: https://github.com/NVIDIA/apex')
     mixed_precision = False  # not installed
 
 wdir = 'weights' + os.sep  # weights dir
@@ -20,18 +22,17 @@ last = wdir + 'last.pt'
 best = wdir + 'best.pt'
 results_file = 'results.txt'
 
-# Hyperparameters https://github.com/ultralytics/yolov3/issues/310
-
+# Hyperparameters
 hyp = {'giou': 3.54,  # giou loss gain
        'cls': 37.4,  # cls loss gain
        'cls_pw': 1.0,  # cls BCELoss positive_weight
        'obj': 64.3,  # obj loss gain (*=img_size/320 if img_size != 320)
        'obj_pw': 1.0,  # obj BCELoss positive_weight
-       'iou_t': 0.225,  # iou training threshold
+       'iou_t': 0.20,  # iou training threshold
        'lr0': 0.01,  # initial learning rate (SGD=5E-3, Adam=5E-4)
        'lrf': 0.0005,  # final learning rate (with cos scheduler)
        'momentum': 0.937,  # SGD momentum
-       'weight_decay': 0.000484,  # optimizer weight decay
+       'weight_decay': 0.0005,  # optimizer weight decay
        'fl_gamma': 0.0,  # focal loss gamma (efficientDet default is gamma=1.5)
        'hsv_h': 0.0138,  # image HSV-Hue augmentation (fraction)
        'hsv_s': 0.678,  # image HSV-Saturation augmentation (fraction)
@@ -48,32 +49,42 @@ if f:
     for k, v in zip(hyp.keys(), np.loadtxt(f[0])):
         hyp[k] = v
 
+# Print focal loss if gamma > 0
+if hyp['fl_gamma']:
+    print('Using FocalLoss(gamma=%g)' % hyp['fl_gamma'])
 
-def train():
+
+def train(hyp):
     cfg = opt.cfg
     data = opt.data
-    img_size, img_size_test = opt.img_size if len(opt.img_size) == 2 else opt.img_size * 2  # train, test sizes
     epochs = opt.epochs  # 500200 batches at bs 64, 117263 images = 273 epochs
     batch_size = opt.batch_size
-    accumulate = opt.accumulate  # effective bs = batch_size * accumulate = 16 * 4 = 64
+    accumulate = max(round(64 / batch_size), 1)  # accumulate n times before optimizer update (bs 64)
     weights = opt.weights  # initial training weights
+    imgsz_min, imgsz_max, imgsz_test = opt.img_size  # img sizes (min, max, test)
 
-    # Initialize
-    init_seeds()
+    # Image Sizes
+    gs = 64  # (pixels) grid size
+    assert math.fmod(imgsz_min, gs) == 0, '--img-size %g must be a %g-multiple' % (imgsz_min, gs)
+    opt.multi_scale |= imgsz_min != imgsz_max  # multi if different (min, max)
     if opt.multi_scale:
-        img_sz_min = round(img_size / 32 / 1.5)
-        img_sz_max = round(img_size / 32 * 1.5)
-        img_size = img_sz_max * 32  # initiate with maximum multi_scale size
-        print('Using multi-scale %g - %g' % (img_sz_min * 32, img_size))
+        if imgsz_min == imgsz_max:
+            imgsz_min //= 1.5
+            imgsz_max //= 0.667
+        grid_min, grid_max = imgsz_min // gs, imgsz_max // gs
+        imgsz_min, imgsz_max = int(grid_min * gs), int(grid_max * gs)
+    img_size = imgsz_max  # initialize with max size
 
     # Configure run
+    init_seeds()
     data_dict = parse_data_cfg(data)
     train_path = data_dict['train']
     test_path = data_dict['valid']
     nc = 1 if opt.single_cls else int(data_dict['classes'])  # number of classes
+    hyp['cls'] *= nc / 80  # update coco-tuned hyp['cls'] to current dataset
 
     # Remove previous results
-    for f in glob.glob('*_batch*.png') + glob.glob(results_file):
+    for f in glob.glob('*_batch*.jpg') + glob.glob(results_file):
         os.remove(f)
 
     # Initialize model
@@ -97,6 +108,7 @@ def train():
         optimizer = optim.SGD(pg0, lr=hyp['lr0'], momentum=hyp['momentum'], nesterov=True)
     optimizer.add_param_group({'params': pg1, 'weight_decay': hyp['weight_decay']})  # add pg1 with weight_decay
     optimizer.add_param_group({'params': pg2})  # add pg2 (biases)
+    print('Optimizer groups: %g .bias, %g Conv2d.weight, %g other' % (len(pg2), len(pg1), len(pg0)))
     del pg0, pg1, pg2
 
     start_epoch = 0
@@ -136,11 +148,11 @@ def train():
     if mixed_precision:
         model, optimizer = amp.initialize(model, optimizer, opt_level='O1', verbosity=0)
 
-    # Scheduler https://github.com/ultralytics/yolov3/issues/238
-    lf = lambda x: (((1 + math.cos(
-        x * math.pi / epochs)) / 2) ** 1.0) * 0.95 + 0.05  # cosine https://arxiv.org/pdf/1812.01187.pdf
-    scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf, last_epoch=start_epoch - 1)
-    # scheduler = lr_scheduler.MultiStepLR(optimizer, [round(epochs * x) for x in [0.8, 0.9]], 0.1, start_epoch - 1)
+    # Scheduler https://arxiv.org/pdf/1812.01187.pdf
+    lf = lambda x: (((1 + math.cos(x * math.pi / epochs)) / 2) ** 1.0) * 0.95 + 0.05  # cosine
+    scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
+    scheduler.last_epoch = start_epoch - 1  # see link below
+    # https://discuss.pytorch.org/t/a-problem-occured-when-resuming-an-optimizer/28822
 
     # Plot lr schedule
     # y = []
@@ -181,7 +193,7 @@ def train():
                                              collate_fn=dataset.collate_fn)
 
     # Testloader
-    testloader = torch.utils.data.DataLoader(LoadImagesAndLabels(test_path, img_size_test, batch_size,
+    testloader = torch.utils.data.DataLoader(LoadImagesAndLabels(test_path, imgsz_test, batch_size,
                                                                  hyp=hyp,
                                                                  rect=True,
                                                                  cache_images=opt.cache_images,
@@ -202,11 +214,12 @@ def train():
 
     # Start training
     nb = len(dataloader)  # number of batches
-    n_burn = max(3 * nb, 300)  # burn-in iterations, max(3 epochs, 300 iterations)
+    n_burn = max(3 * nb, 500)  # burn-in iterations, max(3 epochs, 500 iterations)
     maps = np.zeros(nc)  # mAP per class
     # torch.autograd.set_detect_anomaly(True)
     results = (0, 0, 0, 0, 0, 0, 0)  # 'P', 'R', 'mAP', 'F1', 'val GIoU', 'val Objectness', 'val Classification'
     t0 = time.time()
+    print('Image sizes %g - %g train, %g test' % (imgsz_min, imgsz_max, imgsz_test))
     print('Using %g dataloader workers' % nw)
     print('Starting training for %g epochs...' % epochs)
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
@@ -228,63 +241,61 @@ def train():
 
             # Burn-in
             if ni <= n_burn:
-                model.gr = np.interp(ni, [0, n_burn], [0.0, 1.0])  # giou loss ratio (obj_loss = 1.0 or giou)
-                if ni == n_burn:  # burnin complete
-                    print_model_biases(model)
-
+                xi = [0, n_burn]  # x interp
+                model.gr = np.interp(ni, xi, [0.0, 1.0])  # giou loss ratio (obj_loss = 1.0 or giou)
+                accumulate = max(1, np.interp(ni, xi, [1, 64 / batch_size]).round())
                 for j, x in enumerate(optimizer.param_groups):
                     # bias lr falls from 0.1 to lr0, all other lrs rise from 0.0 to lr0
-                    x['lr'] = np.interp(ni, [0, n_burn], [0.1 if j == 2 else 0.0, x['initial_lr'] * lf(epoch)])
+                    x['lr'] = np.interp(ni, xi, [0.1 if j == 2 else 0.0, x['initial_lr'] * lf(epoch)])
+                    x['weight_decay'] = np.interp(ni, xi, [0.0, hyp['weight_decay'] if j == 1 else 0.0])
                     if 'momentum' in x:
-                        x['momentum'] = np.interp(ni, [0, n_burn], [0.9, hyp['momentum']])
+                        x['momentum'] = np.interp(ni, xi, [0.9, hyp['momentum']])
 
-            # Multi-Scale training
+            # Multi-Scale
             if opt.multi_scale:
                 if ni / accumulate % 1 == 0:  #  adjust img_size (67% - 150%) every 1 batch
-                    img_size = random.randrange(img_sz_min, img_sz_max + 1) * 32
+                    img_size = random.randrange(grid_min, grid_max + 1) * gs
                 sf = img_size / max(imgs.shape[2:])  # scale factor
                 if sf != 1:
-                    ns = [math.ceil(x * sf / 32.) * 32 for x in imgs.shape[2:]]  # new shape (stretched to 32-multiple)
+                    ns = [math.ceil(x * sf / gs) * gs for x in imgs.shape[2:]]  # new shape (stretched to 32-multiple)
                     imgs = F.interpolate(imgs, size=ns, mode='bilinear', align_corners=False)
 
-            # Run model
+            # Forward
             pred = model(imgs)
 
-            # Compute loss
+            # Loss
             loss, loss_items = compute_loss(pred, targets, model)
             if not torch.isfinite(loss):
                 print('WARNING: non-finite loss, ending training ', loss_items)
                 return results
 
-            # Scale loss by nominal batch_size of 64
-            loss *= batch_size / 64
-
-            # Compute gradient
+            # Backward
+            loss *= batch_size / 64  # scale loss
             if mixed_precision:
                 with amp.scale_loss(loss, optimizer) as scaled_loss:
                     scaled_loss.backward()
             else:
                 loss.backward()
 
-            # Optimize accumulated gradient
+            # Optimize
             if ni % accumulate == 0:
                 optimizer.step()
                 optimizer.zero_grad()
                 ema.update(model)
 
-            # Print batch results
+            # Print
             mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
             mem = '%.3gG' % (torch.cuda.memory_cached() / 1E9 if torch.cuda.is_available() else 0)  # (GB)
             s = ('%10s' * 2 + '%10.3g' * 6) % ('%g/%g' % (epoch, epochs - 1), mem, *mloss, len(targets), img_size)
             pbar.set_description(s)
 
-            # Plot images with bounding boxes
+            # Plot
             if ni < 1:
-                f = 'train_batch%g.png' % i  # filename
-                plot_images(imgs=imgs, targets=targets, paths=paths, fname=f)
+                f = 'train_batch%g.jpg' % i  # filename
+                res = plot_images(images=imgs, targets=targets, paths=paths, fname=f)
                 if tb_writer:
-                    tb_writer.add_image(f, cv2.imread(f)[:, :, ::-1], dataformats='HWC')
-                    # tb_writer.add_graph(model, imgs)
+                    tb_writer.add_image(f, res, dataformats='HWC', global_step=epoch)
+                    # tb_writer.add_graph(model, imgs)  # add model to tensorboard
 
             # end batch ------------------------------------------------------------------------------------------------
 
@@ -299,77 +310,67 @@ def train():
             results, maps = test.test(cfg,
                                       data,
                                       batch_size=batch_size,
-                                      img_size=img_size_test,
+                                      imgsz=imgsz_test,
                                       model=ema.ema,
                                       save_json=final_epoch and is_coco,
                                       single_cls=opt.single_cls,
-                                      dataloader=testloader)
+                                      dataloader=testloader,
+                                      multi_label=ni > n_burn)
 
-        # Write epoch results
+        # Write
         with open(results_file, 'a') as f:
             f.write(s + '%10.3g' * 7 % results + '\n')  # P, R, mAP, F1, test_losses=(GIoU, obj, cls)
         if len(opt.name) and opt.bucket:
             os.system('gsutil cp results.txt gs://%s/results/results%s.txt' % (opt.bucket, opt.name))
 
-        # Write Tensorboard results
+        # Tensorboard
         if tb_writer:
-            x = list(mloss) + list(results)
-            titles = ['GIoU', 'Objectness', 'Classification', 'Train loss',
-                      'Precision', 'Recall', 'mAP', 'F1', 'val GIoU', 'val Objectness', 'val Classification']
-            for xi, title in zip(x, titles):
-                tb_writer.add_scalar(title, xi, epoch)
+            tags = ['train/giou_loss', 'train/obj_loss', 'train/cls_loss',
+                    'metrics/precision', 'metrics/recall', 'metrics/mAP_0.5', 'metrics/F1',
+                    'val/giou_loss', 'val/obj_loss', 'val/cls_loss']
+            for x, tag in zip(list(mloss[:-1]) + list(results), tags):
+                tb_writer.add_scalar(tag, x, epoch)
 
         # Update best mAP
         fi = fitness(np.array(results).reshape(1, -1))  # fitness_i = weighted combination of [P, R, mAP, F1]
         if fi > best_fitness:
             best_fitness = fi
 
-        # Save training results
+        # Save model
         save = (not opt.nosave) or (final_epoch and not opt.evolve)
         if save:
-            with open(results_file, 'r') as f:
-                # Create checkpoint
+            with open(results_file, 'r') as f:  # create checkpoint
                 chkpt = {'epoch': epoch,
                          'best_fitness': best_fitness,
                          'training_results': f.read(),
                          'model': ema.ema.module.state_dict() if hasattr(model, 'module') else ema.ema.state_dict(),
                          'optimizer': None if final_epoch else optimizer.state_dict()}
 
-            # Save last checkpoint
+            # Save last, best and delete
             torch.save(chkpt, last)
-
-            # Save best checkpoint
             if (best_fitness == fi) and not final_epoch:
                 torch.save(chkpt, best)
-
-            # Save backup every 10 epochs (optional)
-            # if epoch > 0 and epoch % 10 == 0:
-            #     torch.save(chkpt, wdir + 'backup%g.pt' % epoch)
-
-            # Delete checkpoint
             del chkpt
 
         # end epoch ----------------------------------------------------------------------------------------------------
-
     # end training
+
     n = opt.name
     if len(n):
         n = '_' + n if not n.isnumeric() else n
-        fresults, flast, fbest = 'results%s.txt' % n, 'last%s.pt' % n, 'best%s.pt' % n
-        os.rename('results.txt', fresults)
-        os.rename(wdir + 'last.pt', wdir + flast) if os.path.exists(wdir + 'last.pt') else None
-        os.rename(wdir + 'best.pt', wdir + fbest) if os.path.exists(wdir + 'best.pt') else None
-        if opt.bucket:  # save to cloud
-            os.system('gsutil cp %s gs://%s/results' % (fresults, opt.bucket))
-            os.system('gsutil cp %s gs://%s/weights' % (wdir + flast, opt.bucket))
-            os.system('gsutil cp %s gs://%s/weights' % (wdir + fbest, opt.bucket))
+        fresults, flast, fbest = 'results%s.txt' % n, wdir + 'last%s.pt' % n, wdir + 'best%s.pt' % n
+        for f1, f2 in zip([wdir + 'last.pt', wdir + 'best.pt', 'results.txt'], [flast, fbest, fresults]):
+            if os.path.exists(f1):
+                os.rename(f1, f2)  # rename
+                ispt = f2.endswith('.pt')  # is *.pt
+                strip_optimizer(f2) if ispt else None  # strip optimizer
+                os.system('gsutil cp %s gs://%s/weights' % (f2, opt.bucket)) if opt.bucket and ispt else None  # upload
 
     if not opt.evolve:
         plot_results()  # save as results.png
     print('%g epochs completed in %.3f hours.\n' % (epoch - start_epoch + 1, (time.time() - t0) / 3600))
     dist.destroy_process_group() if torch.cuda.device_count() > 1 else None
     torch.cuda.empty_cache()
-
     return results
 
 
@@ -377,11 +378,10 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--epochs', type=int, default=300)  # 500200 batches at bs 16, 117263 COCO images = 273 epochs
     parser.add_argument('--batch-size', type=int, default=16)  # effective bs = batch_size * accumulate = 16 * 4 = 64
-    parser.add_argument('--accumulate', type=int, default=4, help='batches to accumulate before optimizing')
     parser.add_argument('--cfg', type=str, default='cfg/yolov3-spp.cfg', help='*.cfg path')
     parser.add_argument('--data', type=str, default='data/coco2017.data', help='*.data path')
-    parser.add_argument('--multi-scale', action='store_true', help='adjust (67% - 150%) img_size every 10 batches')
-    parser.add_argument('--img-size', nargs='+', type=int, default=[416], help='train and test image-sizes')
+    parser.add_argument('--multi-scale', action='store_true', help='adjust (67%% - 150%%) img_size every 10 batches')
+    parser.add_argument('--img-size', nargs='+', type=int, default=[320, 640], help='[min_train, max-train, test]')
     parser.add_argument('--rect', action='store_true', help='rectangular training')
     parser.add_argument('--resume', action='store_true', help='resume training from last.pt')
     parser.add_argument('--nosave', action='store_true', help='only save final checkpoint')
@@ -396,7 +396,11 @@ if __name__ == '__main__':
     parser.add_argument('--single-cls', action='store_true', help='train as single-class dataset')
     opt = parser.parse_args()
     opt.weights = last if opt.resume else opt.weights
+    check_git_status()
+    opt.cfg = list(glob.iglob('./**/' + opt.cfg, recursive=True))[0]  # find file
+    # opt.data = list(glob.iglob('./**/' + opt.data, recursive=True))[0]  # find file
     print(opt)
+    opt.img_size.extend([opt.img_size[-1]] * (3 - len(opt.img_size)))  # extend to 3 sizes (min, max, test)
     device = torch_utils.select_device(opt.device, apex=mixed_precision, batch_size=opt.batch_size)
     if device.type == 'cpu':
         mixed_precision = False
@@ -406,15 +410,9 @@ if __name__ == '__main__':
 
     tb_writer = None
     if not opt.evolve:  # Train normally
-        try:
-            # Start Tensorboard with "tensorboard --logdir=runs", view at http://localhost:6006/
-            from torch.utils.tensorboard import SummaryWriter
-
-            tb_writer = SummaryWriter()
-        except:
-            pass
-
-        train()  # train normally
+        print('Start Tensorboard with "tensorboard --logdir=runs", view at http://localhost:6006/')
+        tb_writer = SummaryWriter(comment=opt.name)
+        train(hyp)  # train normally
 
     else:  # Evolve hyperparameters (optional)
         opt.notest, opt.nosave = True, True  # only test/save final epoch
@@ -460,7 +458,7 @@ if __name__ == '__main__':
                 hyp[k] = np.clip(hyp[k], v[0], v[1])
 
             # Train mutation
-            results = train()
+            results = train(hyp.copy())
 
             # Write mutation results
             print_mutation(hyp, results, opt.bucket)

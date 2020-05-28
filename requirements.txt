@@ -1,22 +1,20 @@
 # pip install -U -r requirements.txt
-numpy
+# pycocotools requires numpy 1.17 https://github.com/cocodataset/cocoapi/issues/356
+numpy == 1.17
 opencv-python >= 4.1
-torch >= 1.4
+torch >= 1.5
 matplotlib
 pycocotools
 tqdm
 pillow
+tensorboard >= 1.14
 
 # Nvidia Apex (optional) for mixed precision training --------------------------
 # git clone https://github.com/NVIDIA/apex && cd apex && pip install -v --no-cache-dir --global-option="--cpp_ext" --global-option="--cuda_ext" . --user && cd .. && rm -rf apex
 
-# Tensorboard (optional) pip requirements --------------------------------------
-# tb-nightly
-# future
-
 # Conda commands (in place of pip) ---------------------------------------------
 # conda update -yn base -c defaults conda
-# conda install -yc anaconda numpy opencv matplotlib tqdm pillow ipython future
+# conda install -yc anaconda numpy opencv matplotlib tqdm pillow ipython
 # conda install -yc conda-forge scikit-image pycocotools tensorboard
 # conda install -yc spyder-ide spyder-line-profiler
 # conda install -yc pytorch pytorch torchvision

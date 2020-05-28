@@ -1,5 +1,4 @@
 import argparse
-from sys import platform
 
 from models import *  # set ONNX_EXPORT in models.py
 from utils.datasets import *
@@ -8,7 +7,7 @@ from coco_cvt import cvt2coco
 
 
 def detect(save_img=False):
-    img_size = (320, 192) if ONNX_EXPORT else opt.img_size  # (320, 192) or (416, 256) or (608, 352) for (height, width)
+    imgsz = (320, 192) if ONNX_EXPORT else opt.img_size  # (320, 192) or (416, 256) or (608, 352) for (height, width)
     out, source, weights, half, view_img, save_txt = opt.output, opt.source, opt.weights, opt.half, opt.view_img, opt.save_txt
     webcam = source == '0' or source.startswith('rtsp') or source.startswith('http') or source.endswith('.txt')
 
@@ -19,7 +18,7 @@ def detect(save_img=False):
     os.makedirs(out)  # make new output folder
 
     # Initialize model
-    model = Darknet(opt.cfg, img_size)
+    model = Darknet(opt.cfg, imgsz)
 
     # Load weights
     attempt_download(weights)
@@ -35,18 +34,19 @@ def detect(save_img=False):
         modelc.load_state_dict(torch.load('weights/resnet101.pt', map_location=device)['model'])  # load weights
         modelc.to(device).eval()
 
-    # Fuse Conv2d + BatchNorm2d layers
-    # model.fuse()
-
     # Eval mode
     model.to(device).eval()
+
+    # Fuse Conv2d + BatchNorm2d layers
+    # model.fuse()
 
     # Export mode
     if ONNX_EXPORT:
         model.fuse()
-        img = torch.zeros((1, 3) + img_size)  # (1, 3, 320, 192)
+        img = torch.zeros((1, 3) + imgsz)  # (1, 3, 320, 192)
         f = opt.weights.replace(opt.weights.split('.')[-1], 'onnx')  # *.onnx filename
-        torch.onnx.export(model, img, f, verbose=False, opset_version=11)
+        torch.onnx.export(model, img, f, verbose=False, opset_version=11,
+                          input_names=['images'], output_names=['classes', 'boxes'])
 
         # Validate exported model
         import onnx
@@ -65,10 +65,10 @@ def detect(save_img=False):
     if webcam:
         view_img = True
         torch.backends.cudnn.benchmark = True  # set True to speed up constant image size inference
-        dataset = LoadStreams(source, img_size=img_size)
+        dataset = LoadStreams(source, img_size=imgsz)
     else:
         save_img = True
-        dataset = LoadImages(source, img_size=img_size)
+        dataset = LoadImages(source, img_size=imgsz)
 
     # Get names and colors
     names = load_classes(opt.names)
@@ -79,7 +79,9 @@ def detect(save_img=False):
 
     # Run inference
     t0 = time.time()
-    for idx, (path, img, im0s, vid_cap) in enumerate(dataset):
+    img = torch.zeros((1, 3, imgsz, imgsz), device=device)  # init img
+    _ = model(img.half() if half else img.float()) if device.type != 'cpu' else None  # run once
+    for path, img, im0s, vid_cap in dataset:
         img = torch.from_numpy(img).to(device)
         img = img.half() if half else img.float()  # uint8 to fp16/32
         img /= 255.0  # 0 - 255 to 0.0 - 1.0
@@ -88,18 +90,23 @@ def detect(save_img=False):
 
         # Inference
         t1 = torch_utils.time_synchronized()
-        pred = model(img)[0].float() if half else model(img)[0]
+        pred = model(img, augment=opt.augment)[0]
         t2 = torch_utils.time_synchronized()
 
+        # to float
+        if half:
+            pred = pred.float()
+
         # Apply NMS
-        pred = non_max_suppression(pred, opt.conf_thres, opt.iou_thres, classes=opt.classes, agnostic=opt.agnostic_nms)
+        pred = non_max_suppression(pred, opt.conf_thres, opt.iou_thres,
+                                   multi_label=False, classes=opt.classes, agnostic=opt.agnostic_nms)
 
         # Apply Classifier
         if classify:
             pred = apply_classifier(pred, modelc, img, im0s)
 
         # Process detections
-        for i, det in enumerate(pred):  # detections per image
+        for i, det in enumerate(pred):  # detections for image i
             if webcam:  # batch_size >= 1
                 p, s, im0 = path[i], '%g: ' % i, im0s[i]
             else:
@@ -107,8 +114,9 @@ def detect(save_img=False):
 
             save_path = str(Path(out) / Path(p).name)
             s += '%gx%g ' % img.shape[2:]  # print string
+            gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]  #  normalization gain whwh
             if det is not None and len(det):
-                # Rescale boxes from img_size to im0 size
+                # Rescale boxes from imgsz to im0 size
                 det[:, :4] = scale_coords(img.shape[2:], det[:, :4], im0.shape).round()
 
                 # Print results
@@ -123,8 +131,9 @@ def detect(save_img=False):
                     if int(cls) not in name_indices:
                         continue
                     if save_txt:  # Write to file
-                        with open(save_path + '.txt', 'a') as file:
-                            file.write(('%g ' * 7 + '\n') % (idx, *xyxy, name_indices[int(cls)], conf))
+                        xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
+                        with open(save_path[:save_path.rfind('.')] + '.txt', 'a') as file:
+                            file.write(('%g ' * 5 + '\n') % (cls, *xywh))  # label format
 
                     if save_img or view_img:  # Add bbox to image
                         label = '%s %.2f' % (names[int(name_indices[int(cls)])], conf)
@@ -158,7 +167,7 @@ def detect(save_img=False):
     if save_txt or save_img:
         print('Results saved to %s' % os.getcwd() + os.sep + out)
         if platform == 'darwin':  # MacOS
-            os.system('open ' + out + ' ' + save_path)
+            os.system('open ' + save_path)
 
     print('Done. (%.3fs)' % (time.time() - t0))
 
@@ -180,7 +189,10 @@ if __name__ == '__main__':
     parser.add_argument('--save-txt', action='store_true', help='save results to *.txt')
     parser.add_argument('--classes', nargs='+', type=int, help='filter by class')
     parser.add_argument('--agnostic-nms', action='store_true', help='class-agnostic NMS')
+    parser.add_argument('--augment', action='store_true', help='augmented inference')
     opt = parser.parse_args()
+    opt.cfg = list(glob.iglob('./**/' + opt.cfg, recursive=True))[0]  # find file
+    opt.names = list(glob.iglob('./**/' + opt.names, recursive=True))[0]  # find file
     print(opt)
 
     with torch.no_grad():
