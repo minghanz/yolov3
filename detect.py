@@ -4,6 +4,7 @@ from sys import platform
 from models import *  # set ONNX_EXPORT in models.py
 from utils.datasets import *
 from utils.utils import *
+from coco_cvt import cvt2coco
 
 
 def detect(save_img=False):
@@ -73,9 +74,12 @@ def detect(save_img=False):
     names = load_classes(opt.names)
     colors = [[random.randint(0, 255) for _ in range(3)] for _ in range(len(names))]
 
+    # Get name indices
+    name_indices = cvt2coco(opt.names)
+
     # Run inference
     t0 = time.time()
-    for path, img, im0s, vid_cap in dataset:
+    for idx, (path, img, im0s, vid_cap) in enumerate(dataset):
         img = torch.from_numpy(img).to(device)
         img = img.half() if half else img.float()  # uint8 to fp16/32
         img /= 255.0  # 0 - 255 to 0.0 - 1.0
@@ -109,18 +113,22 @@ def detect(save_img=False):
 
                 # Print results
                 for c in det[:, -1].unique():
+                    if c not in name_indices:
+                        continue
                     n = (det[:, -1] == c).sum()  # detections per class
-                    s += '%g %ss, ' % (n, names[int(c)])  # add to string
+                    s += '%g %ss, ' % (n, names[int(name_indices[c])])  # add to string
 
                 # Write results
                 for *xyxy, conf, cls in det:
+                    if int(cls) not in name_indices:
+                        continue
                     if save_txt:  # Write to file
                         with open(save_path + '.txt', 'a') as file:
-                            file.write(('%g ' * 6 + '\n') % (*xyxy, cls, conf))
+                            file.write(('%g ' * 7 + '\n') % (idx, *xyxy, name_indices[int(cls)], conf))
 
                     if save_img or view_img:  # Add bbox to image
-                        label = '%s %.2f' % (names[int(cls)], conf)
-                        plot_one_box(xyxy, im0, label=label, color=colors[int(cls)])
+                        label = '%s %.2f' % (names[int(name_indices[int(cls)])], conf)
+                        plot_one_box(xyxy, im0, label=label, color=colors[int(name_indices[int(cls)])])
 
             # Print time (inference + NMS)
             print('%sDone. (%.3fs)' % (s, t2 - t1))

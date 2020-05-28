@@ -559,7 +559,7 @@ def non_max_suppression(prediction, conf_thres=0.1, iou_thres=0.6, multi_label=T
                 # weights = (box_iou(boxes, boxes).tril_() > iou_thres) * scores.view(-1, 1)  # box weights
                 # weights /= weights.sum(0)  # normalize
                 # x[:, :4] = torch.mm(weights.T, x[:, :4])
-                weights = (box_iou(boxes[i], boxes) > iou_thres) * scores[None]  # box weights
+                weights = (box_iou(boxes[i], boxes) > iou_thres).float() * scores[None]  # box weights
                 x[i, :4] = torch.mm(weights / weights.sum(1, keepdim=True), x[:, :4]).float()  # merged boxes
         elif method == 'vision':
             i = torchvision.ops.boxes.nms(boxes, scores, iou_thres)
