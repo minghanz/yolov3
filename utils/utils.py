@@ -20,6 +20,14 @@ from tqdm import tqdm
 
 from . import torch_utils  # , google_utils
 
+import torch
+# from d3d.box import box2d_iou, box2d_nms, box2d_crop
+import d3d
+
+# import sys
+# sys.path.append("../../")
+# from bev.rbox_torch import *
+
 # Set printoptions
 torch.set_printoptions(linewidth=320, precision=5, profile='long')
 np.set_printoptions(linewidth=320, formatter={'float_kind': '{:11.5g}'.format})  # format short g, %precision=5
@@ -109,6 +117,76 @@ def xywh2xyxy(x):
     y[:, 3] = x[:, 1] + x[:, 3] / 2  # bottom right y
     return y
 
+def v2yaw(x):
+    ### atan2(sin, cos)
+    y = torch.atan2(x[:,0], x[:,1]) if isinstance(x, torch.Tensor) else np.arctan2(x[:,0], x[:,1])
+    return y
+
+def yaw2v(x):
+    y = torch.stack((torch.sin(x), torch.cos(x)), dim=1) if isinstance(x, torch.Tensor) else np.stack((np.sin(x), np.cos(x)), axis=1)
+    return y
+
+def yaw2mat(x):
+    try:
+        if isinstance(x, torch.Tensor):
+            y = torch.stack([torch.tensor([[torch.cos(x[i]), torch.sin(x[i]) ], [-torch.sin(x[i]), torch.cos(x[i])]]) for i in range(x.shape[0])], dim=0).to(device=x.device) # n*2*2
+        else:
+            y = np.stack([np.array([[np.cos(x[i]), np.sin(x[i]) ], [-np.sin(x[i]), np.cos(x[i])]]) for i in range(x.shape[0])], axis=0) # n*2*2
+    except:
+        print("yaw2mat x", x)
+        raise ValueError("empty x?")
+    return y
+
+def xywh2xyxy_r(x, external_aa=False):
+    # convert n*5 boxes from [x,y,w,h,yaw] to [x1, y1, x2, y2] if external_aa, 
+    # else [x1, y1, x2, y2, x3, y3, x4, y4] from [x_min, y_min] [x_min, y_max] [x_max, y_max], [x_max, y_min]
+    if external_aa:
+        y = torch.zeros((x.shape[0], 4), dtype=x.dtype, device=x.device) if isinstance(x, torch.Tensor) else np.zeros((x.shape[0], 4), dtype=x.dtype)
+    else:
+        y = torch.zeros((x.shape[0], 8), dtype=x.dtype, device=x.device) if isinstance(x, torch.Tensor) else np.zeros((x.shape[0], 8), dtype=x.dtype)
+
+    # xyxy_ur = xywh2xyxy(x[:,:4])
+    y[:, 0] = - x[:, 2] / 2  # top left x
+    y[:, 1] = - x[:, 3] / 2  # top left y
+    y[:, 2] = - x[:, 2] / 2  # bottom left x
+    y[:, 3] =   x[:, 3] / 2  # bottom left y
+    y[:, 4] =   x[:, 2] / 2  # bottom right x
+    y[:, 5] =   x[:, 3] / 2  # bottom right y
+    y[:, 6] =   x[:, 2] / 2  # top right x
+    y[:, 7] = - x[:, 3] / 2  # top right y
+
+    if isinstance(x, torch.Tensor):
+        y = y.reshape(-1, 4, 2).transpose(1,2) # n*2*4      ### the rotation matrix is consistent with random_affine_xywhr() in datasets.py
+        # rot_mat = torch.stack([torch.tensor([[torch.cos(x[i,4]), torch.sin(x[i,4]) ], [-torch.sin(x[i,4]), torch.cos(x[i,4])]]) for i in range(x.shape[0])], dim=0) # n*2*2
+        rot_mat = yaw2mat(x[:,4])
+        y = torch.matmul(rot_mat, y)
+        y = y.transpose(1,2).reshape(-1, 8)
+    else:
+        y = y.reshape(-1, 4, 2).swapaxes(1,2) # n*2*4
+        # rot_mat = np.stack([np.array([[np.cos(x[i,4]), np.sin(x[i,4]) ], [-np.sin(x[i,4]), np.cos(x[i,4])]]) for i in range(x.shape[0])], axis=0) # n*2*2
+        rot_mat = yaw2mat(x[:,4])
+        y = np.matmul(rot_mat, y)
+        y = y.swapaxes(1,2).reshape(-1, 8)
+
+    y += x[:, [0,1,0,1,0,1,0,1]]    # n*8
+    
+    if not external_aa:
+        return y
+    else:
+        if isinstance(x, torch.Tensor):
+            x_min = y[:,[0,2,4,6]].min(dim=1) # n*1
+            x_max = y[:,[0,2,4,6]].max(dim=1) # n*1
+            y_min = y[:,[1,3,5,7]].min(dim=1) # n*1
+            y_max = y[:,[1,3,5,7]].max(dim=1) # n*1
+            y = torch.stack([x_min, y_min, x_max, y_max], dim=1)
+        else:
+            x_min = y[:,[0,2,4,6]].min(axis=1) # n*1
+            x_max = y[:,[0,2,4,6]].max(axis=1) # n*1
+            y_min = y[:,[1,3,5,7]].min(axis=1) # n*1
+            y_max = y[:,[1,3,5,7]].max(axis=1) # n*1
+            y = np.stack([x_min, y_min, x_max, y_max], axis=1)
+        return y
+
 
 def scale_coords(img1_shape, coords, img0_shape, ratio_pad=None):
     # Rescale coords (xyxy) from img1_shape to img0_shape
@@ -125,6 +203,20 @@ def scale_coords(img1_shape, coords, img0_shape, ratio_pad=None):
     clip_coords(coords, img0_shape)
     return coords
 
+def scale_coords_r(img1_shape, coords, img0_shape, ratio_pad=None):
+    # Rescale coords (xyxy) from img1_shape to img0_shape
+    if ratio_pad is None:  # calculate from img0_shape
+        gain = max(img1_shape) / max(img0_shape)  # gain  = old / new
+        pad = (img1_shape[1] - img0_shape[1] * gain) / 2, (img1_shape[0] - img0_shape[0] * gain) / 2  # wh padding
+    else:
+        gain = ratio_pad[0][0]
+        pad = ratio_pad[1]
+
+    coords[:, 0] -= pad[0]  # x padding
+    coords[:, 1] -= pad[1]  # y padding
+    coords[:, :4] /= gain
+    # clip_coords(coords, img0_shape)
+    return coords
 
 def clip_coords(boxes, img_shape):
     # Clip bounding xyxy bounding boxes to image shape (height, width)
@@ -148,6 +240,7 @@ def ap_per_class(tp, conf, pred_cls, target_cls):
 
     # Sort by objectness
     i = np.argsort(-conf)
+    ### sort detections from max conf to min
     tp, conf, pred_cls = tp[i], conf[i], pred_cls[i]
 
     # Find unique classes
@@ -171,15 +264,23 @@ def ap_per_class(tp, conf, pred_cls, target_cls):
 
             # Recall
             recall = tpc / (n_gt + 1e-16)  # recall curve
-            r[ci] = np.interp(-pr_score, -conf[i], recall[:, 0])  # r at pr_score, negative x, xp because xp decreases
+            # r[ci] = np.interp(-pr_score, -conf[i], recall[:, 0])  # r at pr_score, negative x, xp because xp decreases
+            ### use "-conf[i]" because np.interp(x, xp, fp) must accept increasing xp (https://numpy.org/doc/stable/reference/generated/numpy.interp.html)
 
             # Precision
             precision = tpc / (tpc + fpc)  # precision curve
-            p[ci] = np.interp(-pr_score, -conf[i], precision[:, 0])  # p at pr_score
+            # p[ci] = np.interp(-pr_score, -conf[i], precision[:, 0])  # p at pr_score
 
             # AP from recall-precision curve
             for j in range(tp.shape[1]):
                 ap[ci, j] = compute_ap(recall[:, j], precision[:, j])
+
+                # Recall
+                r[ci, j] = np.interp(-pr_score, -conf[i], recall[:, j])  # r at pr_score, negative x, xp because xp decreases
+                ### use "-conf[i]" because np.interp(x, xp, fp) must accept increasing xp (https://numpy.org/doc/stable/reference/generated/numpy.interp.html)
+
+                # Precision
+                p[ci, j] = np.interp(-pr_score, -conf[i], precision[:, j])  # p at pr_score
 
             # Plot
             # fig, ax = plt.subplots(1, 1, figsize=(5, 5))
@@ -225,8 +326,28 @@ def compute_ap(recall, precision):
 
     return ap
 
+def lin_iou(box1, box2):
+
+    # inter = (torch.min(box1[:, None, 2:], box2[:, 2:]) - torch.max(box1[:, None, :2], box2[:, :2])).clamp(0).prod(2)
+
+    dist = (box1[:, None, :2] - box2[:, :2]).norm(dim=2)
+
+    dist_ratio = (1 - dist / box2[:, 3]).clamp(0)
+    return dist_ratio
 
 def bbox_iou(box1, box2, x1y1x2y2=True, GIoU=False, DIoU=False, CIoU=False):
+    if box1.shape[0] == 4:
+        assert box1.shape[0] == box2.shape[1]
+        return bbox_iou_aa(box1, box2, x1y1x2y2, GIoU, DIoU, CIoU)
+    else:
+        assert box1.shape[0] == 5
+        return bbox_iou_r(box1, box2, GIoU, DIoU, CIoU)
+
+def bbox_iou_r(box1, box2, GIoU=False, DIoU=False, CIoU=False):
+    ### box is of n*5 with each row: xywhr
+    pass
+
+def bbox_iou_aa(box1, box2, x1y1x2y2=True, GIoU=False, DIoU=False, CIoU=False):
     # Returns the IoU of box1 to box2. box1 is 4, box2 is nx4
     box2 = box2.t()
 
@@ -304,6 +425,11 @@ def wh_iou(wh1, wh2):
     inter = torch.min(wh1, wh2).prod(2)  # [N,M]
     return inter / (wh1.prod(2) + wh2.prod(2) - inter)  # iou = inter / (area1 + area2 - inter)
 
+def r_align(r1, r2):
+    r1 = r1[:, None]
+    r2 = r2[None]
+    cos = torch.cos(r1 - r2) # if cos > 0, then the angle difference is less than 90 degree 
+    return cos
 
 class FocalLoss(nn.Module):
     # Wraps focal loss around existing loss_fcn(), i.e. criteria = FocalLoss(nn.BCEWithLogitsLoss(), gamma=1.5)
@@ -340,16 +466,25 @@ def smooth_BCE(eps=0.1):  # https://github.com/ultralytics/yolov3/issues/238#iss
     return 1.0 - 0.5 * eps, 0.5 * eps
 
 
-def compute_loss(p, targets, model):  # predictions, targets, model
+def compute_loss(p, targets, model, use_giou_loss=False, half_angle=False):  # predictions, targets, model
+    ### input p here is training output
+
     ft = torch.cuda.FloatTensor if p[0].is_cuda else torch.Tensor
     lcls, lbox, lobj = ft([0]), ft([0]), ft([0])
-    tcls, tbox, indices, anchors = build_targets(p, targets, model)  # targets
+    lxy, lwh = ft([0]), ft([0])
+    lr = ft([0])
+    rotated = targets.shape[1] == 7
+    tcls, tbox, indices, anchors, twh, txy, tyaw = build_targets(p, targets, model, half_angle)  # targets  ### twh, txy are added for bbox l1/MSE loss 
+    rotated_anchor = len(tyaw)>0
+
     h = model.hyp  # hyperparameters
     red = 'mean'  # Loss reduction (sum or mean)
 
     # Define criteria
     BCEcls = nn.BCEWithLogitsLoss(pos_weight=ft([h['cls_pw']]), reduction=red)
     BCEobj = nn.BCEWithLogitsLoss(pos_weight=ft([h['obj_pw']]), reduction=red)
+    MSE = nn.MSELoss(reduction=red)
+    MSE_full = nn.MSELoss(reduction='none')
 
     # class label smoothing https://arxiv.org/pdf/1902.04103.pdf eqn 3
     cp, cn = smooth_BCE(eps=0.0)
@@ -369,32 +504,116 @@ def compute_loss(p, targets, model):  # predictions, targets, model
         if nb:
             nt += nb  # cumulative targets
             ps = pi[b, a, gj, gi]  # prediction subset corresponding to targets
+            ### b, a, gj, gi are all 1D vector of the same length, combining together to form the indices in pi
 
             # GIoU
+            # print(b,a,gj,gi)
+            # print("ps", ps)
+            # print("giou", i, )
+            # print("anchors", anchors[i].shape)
+            # print("pswh", ps[:, 2:4].shape)
             pxy = ps[:, :2].sigmoid()
-            pwh = ps[:, 2:4].exp().clamp(max=1E3) * anchors[i]
-            pbox = torch.cat((pxy, pwh), 1)  # predicted box
-            giou = bbox_iou(pbox.t(), tbox[i], x1y1x2y2=False, GIoU=True)  # giou(prediction, target)
-            lbox += (1.0 - giou).sum() if red == 'sum' else (1.0 - giou).mean()  # giou loss
+            pwh = ps[:, 2:4].exp().clamp(max=1E3) * anchors[i][:,:2]
+            if not rotated:
+                pbox = torch.cat((pxy, pwh), 1)  # predicted box
+                giou = bbox_iou(pbox.t(), tbox[i], x1y1x2y2=False, GIoU=True)  # giou(prediction, target)
+            else:
+                ### here it is actually iou instead of giou
+                if not rotated_anchor:
+                    prvec = nn.functional.normalize(ps[:, 4:6], dim=-1)
+                    pyaw = v2yaw(prvec)
+                    ### when calculating iou, rotation difference of 180 does not matter.
+                else:
+                    if half_angle:
+                        pyaw_local = (torch.sigmoid(ps[:, 4])-0.5) * math.pi
+                    else:
+                        pyaw_local = (torch.sigmoid(ps[:, 4])-0.5) * math.pi * 1.5
+                    pyaw = pyaw_local + anchors[i][:,2]
+
+                pbox = torch.cat((pxy, pwh, -pyaw.unsqueeze(1)), 1)  # predicted box
+                tbox_i = tbox[i].clone()
+                tbox_i[:, 4] = - tbox_i[:, 4]
+                giou = d3d.box.box2d_iou(pbox, tbox_i, method="rbox")
+                giou = torch.diag(giou)     # d3d.box.box2d_iou produces iou of every pair of boxes
+            if use_giou_loss:
+                lbox += (1.0 - giou).sum() if red == 'sum' else (1.0 - giou).mean()  # giou loss
+            else:
+                lxy += MSE(pxy, txy[i])  # xy loss
+                lwh += MSE(ps[:, 2:4], twh[i])  # wh yolo loss
+                if rotated:
+                    ### box coordinate regression?
+                    tbox_i_xy8 = xywh2xyxy_r(tbox[i])
+                    if (not rotated_anchor) and half_angle:
+                        pbox_i_xywhr = torch.cat((pxy, pwh, pyaw.unsqueeze(1)), 1)
+                        pbox_i_xy8_1 = xywh2xyxy_r(pbox_i_xywhr)
+                        coord_loss_1 = MSE_full(pbox_i_xy8_1, tbox_i_xy8)
+                        pbox_i_xywhr2 = torch.cat((pxy, pwh, pyaw.unsqueeze(1)+math.pi), 1)
+                        pbox_i_xy8_2 = xywh2xyxy_r(pbox_i_xywhr2)
+                        coord_loss_2 = MSE_full(pbox_i_xy8_2, tbox_i_xy8)
+                        lbox += torch.min(coord_loss_1, coord_loss_2).mean() if red == 'mean' else torch.min(coord_loss_1, coord_loss_2).sum()
+                    else:
+                        pbox_i_xywhr = torch.cat((pxy, pwh, pyaw.unsqueeze(1)), 1)
+                        # pbox_i_xywhr.register_hook(lambda grad: print("pbox_i_xywhr grad:", grad))
+                        pbox_i_xy8 = xywh2xyxy_r(pbox_i_xywhr)
+                        # pbox_i_xy8.register_hook(lambda grad: print("pbox_i_xy8 grad:", grad))
+                        lbox += MSE(pbox_i_xy8, tbox_i_xy8)
+
+                    if not rotated_anchor:
+                        tyaw = tbox[i][:,4]
+                        trvec = yaw2v(tyaw)
+                        # trvec = torch.cat((torch.sin(tyaw), torch.cos(tyaw)), dim=1)  ### rotated vec consistent with YOLOLayer in models.py
+                        if half_angle:
+                            vec_loss_1 = MSE_full(prvec, trvec)
+                            vec_loss_2 = MSE_full(-prvec, trvec)
+                            lr += torch.min(vec_loss_1, vec_loss_2).mean() if red == 'mean' else torch.min(vec_loss_1, vec_loss_2).sum()
+                        else:
+                            lr += MSE(prvec, trvec)  # wh yolo loss
+                    else:
+                        if half_angle:
+                            lr += MSE(pyaw_local, tyaw[i])
+                            # lr += torch.sin((pyaw_local - tyaw[i])/2).pow(2).sum() if red == 'sum' else torch.sin((pyaw_local - tyaw[i])/2).pow(2).mean()  # giou loss
+                        else:
+                            # lr += torch.sin((pyaw_local - tyaw[i])/2).abs().sum() if red == 'sum' else torch.sin((pyaw_local - tyaw[i])/2).abs().mean()  # giou loss
+                            lr += torch.sin((pyaw_local - tyaw[i])/2).pow(2).sum() if red == 'sum' else torch.sin((pyaw_local - tyaw[i])/2).pow(2).mean()  # giou loss
+
 
             # Obj
             tobj[b, a, gj, gi] = (1.0 - model.gr) + model.gr * giou.detach().clamp(0).type(tobj.dtype)  # giou ratio
 
             # Class
             if model.nc > 1:  # cls loss (only if multiple classes)
-                t = torch.full_like(ps[:, 5:], cn)  # targets
-                t[range(nb), tcls[i]] = cp
-                lcls += BCEcls(ps[:, 5:], t)  # BCE
+                if rotated:
+                    if not rotated_anchor:
+                        t = torch.full_like(ps[:, 7:], cn)  # targets
+                        t[range(nb), tcls[i]] = cp
+                        lcls += BCEcls(ps[:, 7:], t)  # BCE
+                    else:
+                        t = torch.full_like(ps[:, 6:], cn)  # targets
+                        t[range(nb), tcls[i]] = cp
+                        lcls += BCEcls(ps[:, 6:], t)  # BCEvvvvvvv
+                else:
+                    t = torch.full_like(ps[:, 5:], cn)  # targets
+                    t[range(nb), tcls[i]] = cp
+                    lcls += BCEcls(ps[:, 5:], t)  # BCE
 
             # Append targets to text file
             # with open('targets.txt', 'a') as file:
             #     [file.write('%11.5g ' * 4 % tuple(x) + '\n') for x in torch.cat((txy[i], twh[i]), 1)]
 
-        lobj += BCEobj(pi[..., 4], tobj)  # obj loss
+        if rotated:
+            if not rotated_anchor:
+                lobj += BCEobj(pi[..., 6], tobj)  # obj loss
+            else:
+                lobj += BCEobj(pi[..., 5], tobj)  # obj loss
+        else:
+            lobj += BCEobj(pi[..., 4], tobj)  # obj loss
 
     lbox *= h['giou']
     lobj *= h['obj']
     lcls *= h['cls']
+    lxy *= h['xy']
+    lwh *= h['wh']
+    lr *= h['r']
     if red == 'sum':
         bs = tobj.shape[0]  # batch size
         g = 3.0  # loss gain
@@ -402,33 +621,68 @@ def compute_loss(p, targets, model):  # predictions, targets, model
         if nt:
             lcls *= g / nt / model.nc
             lbox *= g / nt
+            lxy *= g / nt
+            lwh *= g / nt
+            lr *= g / nt
 
-    loss = lbox + lobj + lcls
-    return loss, torch.cat((lbox, lobj, lcls, loss)).detach()
+    # loss = lbox + lobj + lcls
+    # return loss, torch.cat((lbox, lobj, lcls, loss)).detach()
+    loss = lbox + lobj + lcls + lxy + lwh + lr
+    return loss, torch.cat((lbox, lobj, lcls, lxy, lwh, lr, loss)).detach()
 
 
-def build_targets(p, targets, model):
+def build_targets(p, targets, model, half_angle):
     # Build targets for compute_loss(), input targets(image,class,x,y,w,h)
+    # or (image,class,x,y,w,h,y) for rotated boxes
+    ### note that we only use wh to filter out some anchor-detection matches. Not using location (xy) or yaw.
+    ### the intention of this function is to return targets with their matched anchors
     nt = targets.shape[0]
     tcls, tbox, indices, anch = [], [], [], []
-    gain = torch.ones(6, device=targets.device)  # normalized to gridspace gain
+    twh, txy, tyaw = [], [], [] ### add back this because we want to use l2 (mseloss) of rotated boxes, because giou is not available for rotated iou/giou yet.
+
+    rotated = targets.shape[1] == 7
+    
+    if not rotated:
+        gain = torch.ones(6, device=targets.device)  # normalized to gridspace gain
+    else:
+        gain = torch.ones(7, device=targets.device)  # normalized to gridspace gain (for rotated case)
     off = torch.tensor([[1, 0], [0, 1], [-1, 0], [0, -1]], device=targets.device).float()  # overlap offsets
 
     style = None
     multi_gpu = type(model) in (nn.parallel.DataParallel, nn.parallel.DistributedDataParallel)
     for i, j in enumerate(model.yolo_layers):
         anchors = model.module.module_list[j].anchor_vec if multi_gpu else model.module_list[j].anchor_vec
-        gain[2:] = torch.tensor(p[i].shape)[[3, 2, 3, 2]]  # xyxy gain
-        na = anchors.shape[0]  # number of anchors
+        rotated_anchor = anchors.shape[1] == 3
+        ### lower level layer, denser grid, smaller stride, smaller anchors, targeting smaller objects
+        ### three layers, each with three anchors        
+        gain[2:6] = torch.tensor(p[i].shape)[[3, 2, 3, 2]]  # xyxy gain
+        ### note that p[i].shape == (bs, anchors, ny, nx, classes + xywh)
+        ### now gain == [1,1,nx, ny, nx, ny]
+        na = anchors.shape[0]  # number of anchors, anchors are n*2 for non-rotated cfg (see .cfg files)
         at = torch.arange(na).view(na, 1).repeat(1, nt)  # anchor tensor, same as .repeat_interleave(nt)
 
         # Match targets to anchors
         a, t, offsets = [], targets * gain, 0
+        ### targets recovered to t=[image, class, xpx, ypx, wpx, hpx, [yaw]] in grid coordinate
+
         if nt:
             # r = t[None, :, 4:6] / anchors[:, None]  # wh ratio
             # j = torch.max(r, 1. / r).max(2)[0] < model.hyp['anchor_t']  # compare
-            j = wh_iou(anchors, t[:, 4:6]) > model.hyp['iou_t']  # iou(3,n) = wh_iou(anchors(3,2), gwh(n,2))
+            ### this is to filter out those detection-anchor pairs meeting wt_iou criteria
+            if not rotated_anchor:
+                whiou = wh_iou(anchors, t[:, 4:6]) #> model.hyp['iou_t']  # iou(3,n) = wh_iou(anchors(3,2), gwh(n,2))
+                j = whiou > model.hyp['iou_t']      ### a bool matrix of na(3)*nt
+            else:
+                assert anchors.shape[1] == 3
+                assert rotated
+                if half_angle:
+                    whiou = wh_iou(anchors[:, :2], t[:, 4:6]) #> model.hyp['iou_t']  # iou(3,n) = wh_iou(anchors(3,2), gwh(n,2))
+                    j = whiou > model.hyp['iou_t']      ### a bool matrix of na(3)*nt
+                else:
+                    riou = r_align(anchors[:, 2], t[:, 6])
+                    j = riou > 0
             a, t = at[j], t.repeat(na, 1, 1)[j]  # filter
+            ### a is n_filtered index, and t is now n_filtered * 6 or 7 matrix, both are in terms of n*m
 
             # overlaps
             gxy = t[:, 2:4]  # grid xy
@@ -452,25 +706,55 @@ def build_targets(p, targets, model):
         gwh = t[:, 4:6]  # grid wh
         gij = (gxy - offsets).long()
         gi, gj = gij.T  # grid xy indices
+        if rotated:
+            gyaw = t[:, 6:7]
+            if half_angle:
+                if rotated_anchor:
+                    ### to guarantee the gt is achievable from anchor, need to ensure gt is within pi/2 to anchors
+                    need_flip_idx = (gyaw[:, 0] - anchors[a][:, 2]).abs() > math.pi/2
+                    anch_yaw = anchors[a][need_flip_idx, 2]
+                    gyaw[need_flip_idx, 0] = anch_yaw + torch.atan(torch.tan( gyaw[need_flip_idx, 0]-anch_yaw ))
+                else:
+                    ### directional vector use both signs and take the min, no need to do things here
+                    pass 
 
         # Append
         indices.append((b, a, gj, gi))  # image, anchor, grid indices
-        tbox.append(torch.cat((gxy - gij, gwh), 1))  # box
+        if rotated:
+            tbox.append(torch.cat((gxy - gij, gwh, gyaw), 1))  # box
+        else:
+            tbox.append(torch.cat((gxy - gij, gwh), 1))  # box
         anch.append(anchors[a])  # anchors
         tcls.append(c)  # class
+
+        twh.append(torch.log(gwh / anchors[a][:, :2]))
+        txy.append(gxy - gij)
+
+        if rotated_anchor:
+            # tyaw.append(gyaw - anchors[a][:, 2])
+            tyaw.append(gyaw[:,0] - anchors[a][:, 2])
+
         if c.shape[0]:  # if any targets
             assert c.max() < model.nc, 'Model accepts %g classes labeled from 0-%g, however you labelled a class %g. ' \
                                        'See https://github.com/ultralytics/yolov3/wiki/Train-Custom-Data' % (
                                            model.nc, model.nc - 1, c.max())
+    # print("len(tbox)", len(tbox))
+    # for i in range(len(tbox)):
+    #     print("tbox[%d].shape"%i, tbox[i].shape)
+    # for i in range(len(tbox)):
+    #     if tbox[i].numel() > 0:
+    #         print("tbox[%d].min(dim=0)"%i, tbox[i].min(dim=0))
+    #         print("tbox[%d].max(dim=0)"%i, tbox[i].max(dim=0))
 
-    return tcls, tbox, indices, anch
+    return tcls, tbox, indices, anch, twh, txy, tyaw
 
 
-def non_max_suppression(prediction, conf_thres=0.1, iou_thres=0.6, multi_label=True, classes=None, agnostic=False):
+def non_max_suppression(prediction, conf_thres=0.1, iou_thres=0.6, multi_label=True, classes=None, agnostic=False, rotated=False, rotated_anchor=False):
     """
     Performs  Non-Maximum Suppression on inference results
     Returns detections with shape:
         nx6 (x1, y1, x2, y2, conf, cls)
+        or n*7 (x1, y1, x2, y2, yaw, conf, cls) for rotated bbox
     """
 
     # Settings
@@ -479,63 +763,148 @@ def non_max_suppression(prediction, conf_thres=0.1, iou_thres=0.6, multi_label=T
     time_limit = 10.0  # seconds to quit after
 
     t = time.time()
-    nc = prediction[0].shape[1] - 5  # number of classes
+    if rotated:
+        if rotated_anchor:
+            nc = prediction[0].shape[1] - 6  # number of classes
+            conf_idx = 5
+            conf_x_idx = 5
+        else:
+            nc = prediction[0].shape[1] - 7  # number of classes
+            conf_idx = 6
+            conf_x_idx = 5
+    else:
+        nc = prediction[0].shape[1] - 5  # number of classes
+        conf_idx = 4
+        conf_x_idx = 4
     multi_label &= nc > 1  # multiple labels per box
     output = [None] * prediction.shape[0]
     for xi, x in enumerate(prediction):  # image index, image inference
+        ### this is in terms of batch
+        # vnorm = x[:,4:6].norm(dim=1)
+        # print("vnorm.min()", vnorm.min())
+        # print("vnorm.max()", vnorm.max())
+        # print("pred[%d][:,4].min()"%xi, x[:,4].min())
+        # print("pred[%d][:,4].max()"%xi, x[:,4].max())
+        # print("pred[%d][:,5].min()"%xi, x[:,5].min())
+        # print("pred[%d][:,5].max()"%xi, x[:,5].max())
+        # print("pred[%d][:,6].min()"%xi, x[:,6].min())
+        # print("pred[%d][:,6].max()"%xi, x[:,6].max())
+        # print("pred[%d][0,4:6]"%xi, x[0,4:7])
+        # print("pred[%d][1,4:6]"%xi, x[1,4:7])
+
         # Apply constraints
-        x = x[x[:, 4] > conf_thres]  # confidence
+        x = x[x[:, conf_idx] > conf_thres]  # confidence
         x = x[((x[:, 2:4] > min_wh) & (x[:, 2:4] < max_wh)).all(1)]  # width-height
+        # x = x[(x[:, 0]>208) | (x[:, 1] > 272)]        ### only applicable to Jackson lturn
 
         # If none remain process next image
         if not x.shape[0]:
             continue
 
         # Compute conf
-        x[..., 5:] *= x[..., 4:5]  # conf = obj_conf * cls_conf
+        x[..., conf_idx+1:] *= x[..., conf_idx:conf_idx+1]  # conf = obj_conf * cls_conf
 
-        # Box (center x, center y, width, height) to (x1, y1, x2, y2)
-        box = xywh2xyxy(x[:, :4])
+        if not rotated:
+            # Box (center x, center y, width, height) to (x1, y1, x2, y2)
+            box = xywh2xyxy(x[:, :4])
+        else:
+            box = torch.zeros((x.shape[0], 5), dtype=x.dtype, device=x.device)
+            box[:, :4] = x[:, :4]
+            if rotated_anchor:
+                box[:, 4] = x[:, 4]
+            else:
+                box[:, 4] = v2yaw(x[:, 4:6])
+        ############# vx vy are transformed to yaw here
 
         # Detections matrix nx6 (xyxy, conf, cls)
         if multi_label:
-            i, j = (x[:, 5:] > conf_thres).nonzero().t()
-            x = torch.cat((box[i], x[i, j + 5].unsqueeze(1), j.float().unsqueeze(1)), 1)
+            i, j = (x[:, conf_idx+1:] > conf_thres).nonzero().t()
+            x_cc = torch.cat((box[i], x[i, j + conf_idx+1].unsqueeze(1), j.float().unsqueeze(1)), 1)
+            x = x[i] 
         else:  # best class only
-            conf, j = x[:, 5:].max(1)
-            x = torch.cat((box, conf.unsqueeze(1), j.float().unsqueeze(1)), 1)[conf > conf_thres]
+            conf, j = x[:, conf_idx+1:].max(1)
+            x_cc = torch.cat((box, conf.unsqueeze(1), j.float().unsqueeze(1)), 1)[conf > conf_thres]
+            x = x[conf > conf_thres]
 
         # Filter by class
         if classes:
-            x = x[(j.view(-1, 1) == torch.tensor(classes, device=j.device)).any(1)]
+            x_cc = x_cc[(j.view(-1, 1) == torch.tensor(classes, device=j.device)).any(1)]
 
         # Apply finite constraint
         # if not torch.isfinite(x).all():
         #     x = x[torch.isfinite(x).all(1)]
 
         # If none remain process next image
-        n = x.shape[0]  # number of boxes
+        n = x_cc.shape[0]  # number of boxes
         if not n:
+            # print("NMS skipped because no left after conf and class filtering", xi)
+            # print("x_cc", x_cc)
+            # print("conf.max()", conf.max(), conf_thres)
             continue
 
         # Sort by confidence
         # x = x[x[:, 4].argsort(descending=True)]
 
         # Batched NMS
-        c = x[:, 5] * 0 if agnostic else x[:, 5]  # classes
-        boxes, scores = x[:, :4].clone() + c.view(-1, 1) * max_wh, x[:, 4]  # boxes (offset by class), scores
-        i = torchvision.ops.boxes.nms(boxes, scores, iou_thres)
-        if merge and (1 < n < 3E3):  # Merge NMS (boxes merged using weighted mean)
-            try:  # update boxes as boxes(i,4) = weights(i,n) * boxes(n,4)
+        c = x_cc[:, conf_x_idx+1] * 0 if agnostic else x_cc[:, conf_x_idx+1]  # classes
+        if not rotated:
+            boxes, scores = x_cc[:, :4].clone() + c.view(-1, 1) * max_wh, x_cc[:, conf_x_idx]  # boxes (offset by class), scores
+            i = torchvision.ops.boxes.nms(boxes, scores, iou_thres)
+            if len(i) ==0:
+                continue
+        else:
+            scores = x_cc[:, conf_x_idx]
+            boxes = x_cc[:, :conf_x_idx].clone()
+            boxes[:, :2] += c.view(-1, 1) * max_wh
+            boxes_d3d = boxes.clone()
+            boxes_d3d[:, 4] = - boxes[:, 4]
+            i_mask = d3d.box.box2d_nms(boxes_d3d, scores, iou_method="rbox", iou_threshold=iou_thres)
+            if i_mask.sum() == 0:
+                continue
+            
+        if merge and (1 < n < 3E4):  # Merge NMS (boxes merged using weighted mean)
+        # if merge and (1 < n < 3E3):  # Merge NMS (boxes merged using weighted mean)
+            # try:  # update boxes as boxes(i,4) = weights(i,n) * boxes(n,4)
+            if not rotated:
                 iou = box_iou(boxes[i], boxes) > iou_thres  # iou matrix
                 weights = iou * scores[None]  # box weights
-                x[i, :4] = torch.mm(weights, x[:, :4]).float() / weights.sum(1, keepdim=True)  # merged boxes
-                # i = i[iou.sum(1) > 1]  # require redundancy
-            except:  # possible CUDA error https://github.com/ultralytics/yolov3/issues/1139
-                print(x, i, x.shape, i.shape)
-                pass
+                x_cc[i, :4] = torch.mm(weights, x_cc[:, :4]).float() / weights.sum(1, keepdim=True)  # merged boxes
+                ### xyxy
+            else:
+                boxes_d3d_i = boxes_d3d[i_mask]#.clone().contiguous()
+                # print(i_mask)
+                # print(i_mask.shape)
+                # print(boxes_d3d_i.shape, boxes_d3d_i.dtype, boxes_d3d_i.device)
+                # print(boxes_d3d.shape, boxes_d3d.dtype, boxes_d3d.device)
+                iou = d3d.box.box2d_iou(boxes_d3d_i, boxes_d3d, method="rbox") #> iou_thres  # iou matrix                
+                iou = iou > iou_thres
+                weights = iou * scores[None]  # box weights
+                if rotated_anchor:
+                    x_xywh = torch.mm(weights, x[:, :4]).float() / weights.sum(1, keepdim=True)  # merged boxes 
+                    v = yaw2v(x[:, 4])
+                    x_v = torch.mm(weights, v).float() / weights.sum(1, keepdim=True)  # merged boxes 
+                    x_r = v2yaw(x_v)
+                    x_cc[i_mask, :4] = x_xywh
+                    x_cc[i_mask, 4] = x_r
+                else:
+                    x_vcc = torch.mm(weights, x[:, :6]).float() / weights.sum(1, keepdim=True)  # merged boxes      
+                    ### note that here we are averaging xywh and rot vec while in non-rotated case the average is on xyxy
+                    x_r = v2yaw(x_vcc[:, 4:6])
+                    x_cc[i_mask, :4] = x_vcc[:, :4]
+                    x_cc[i_mask, 4] = x_r
+                ### xywhr
 
-        output[xi] = x[i]
+                # i = i[iou.sum(1) > 1]  # require redundancy
+            # except:  # possible CUDA error https://github.com/ultralytics/yolov3/issues/1139
+            #     if not rotated:
+            #         print(x_cc, i, x_cc.shape, i.shape)
+            #     else:
+            #         print(x_cc, i_mask, x_cc.shape, i_mask.shape)
+            #     pass
+        if not rotated:
+            output[xi] = x_cc[i]
+        else:
+            output[xi] = x_cc[i_mask]
         if (time.time() - t) > time_limit:
             break  # time limit exceeded
 
@@ -783,13 +1152,14 @@ def apply_classifier(x, model, img, im0):
 def fitness(x):
     # Returns fitness (for use with results.txt or evolve.txt)
     w = [0.0, 0.01, 0.99, 0.00]  # weights for [P, R, mAP, F1]@0.5 or [P, R, mAP@0.5, mAP@0.5:0.95]
-    return (x[:, :4] * w).sum(1)
+    return float((x[:, :4] * w).sum(1))
 
 
 def output_to_target(output, width, height):
     """
     Convert a YOLO model output to target format
     [batch_id, class_id, x, y, w, h, conf]
+    input is xyxy, conf, class
     """
     if isinstance(output, torch.Tensor):
         output = output.cpu().numpy()
@@ -810,18 +1180,68 @@ def output_to_target(output, width, height):
 
     return np.array(targets)
 
+def output_to_target_r(output, width, height):
+    """
+    Convert a YOLO model output to target format
+    [batch_id, class_id, x, y, w, h, r, conf]
+    input is xywhr, conf, class
+    """
+
+    if isinstance(output, torch.Tensor):
+        output = output.cpu().numpy()
+    if isinstance(output, list):
+        if any(isinstance(output[i], torch.Tensor) for i in range(len(output))):
+            try:
+                output = [output[i].cpu().numpy() if output[i] is not None else None for i in range(len(output)) ]
+            except:
+                print("output_to_target_r", output)
+                raise ValueError("something happened")
+        else:
+            ### if all are none, return a 0*8 np array
+            return np.ones((0,8))
+
+    ### if we are here, then at least some item of output is not zero and is a valid numpy array
+    targets = []
+    for i, o in enumerate(output):
+        if o is not None:
+            for pred in o:
+                box = pred[:4]
+                w = box[2] / width
+                h = box[3] / height
+                x = box[0] / width
+                y = box[1] / height
+                yaw = pred[4]
+                conf = pred[5]
+                cls = int(pred[6])
+
+                targets.append([i, cls, x, y, w, h, yaw, conf])
+
+    return np.array(targets)
+
 
 # Plotting functions ---------------------------------------------------------------------------------------------------
 def plot_one_box(x, img, color=None, label=None, line_thickness=None):
+    if isinstance(x, list):
+        rotated = len(x) == 8
+    elif isinstance(x, np.ndarray):
+        rotated = x.shape[0] == 8
     # Plots one bounding box on image img
     tl = line_thickness or round(0.002 * (img.shape[0] + img.shape[1]) / 2) + 1  # line/font thickness
     color = color or [random.randint(0, 255) for _ in range(3)]
-    c1, c2 = (int(x[0]), int(x[1])), (int(x[2]), int(x[3]))
-    cv2.rectangle(img, c1, c2, color, thickness=tl, lineType=cv2.LINE_AA)
+    if not rotated:
+        c1, c2 = (int(x[0]), int(x[1])), (int(x[2]), int(x[3]))
+        cv2.rectangle(img, c1, c2, color, thickness=tl, lineType=cv2.LINE_AA)
+    else:
+        pts = x.reshape(4,2).round().astype(int)
+        cv2.polylines(img, [pts], isClosed=True, color=color, thickness=tl, lineType=cv2.LINE_AA)
     if label:
         tf = max(tl - 1, 1)  # font thickness
         t_size = cv2.getTextSize(label, 0, fontScale=tl / 3, thickness=tf)[0]
-        c2 = c1[0] + t_size[0], c1[1] - t_size[1] - 3
+        if not rotated:
+            c2 = c1[0] + t_size[0], c1[1] - t_size[1] - 3
+        else:
+            c1 = tuple(pts[0])
+            c2 = (c1[0] + t_size[0]), (c1[1] - t_size[1] - 3)
         cv2.rectangle(img, c1, c2, color, -1, cv2.LINE_AA)  # filled
         cv2.putText(img, label, (c1[0], c1[1] - 2), 0, tl / 3, [225, 255, 255], thickness=tf, lineType=cv2.LINE_AA)
 
@@ -846,7 +1266,10 @@ def plot_wh_methods():  # from utils.utils import *; plot_wh_methods()
     fig.savefig('comparison.png', dpi=200)
 
 
-def plot_images(images, targets, paths=None, fname='images.jpg', names=None, max_size=640, max_subplots=16):
+def plot_images(images, targets, paths=None, fname='images.jpg', names=None, max_size=640, max_subplots=16, gt=True):
+    ### targets: [batch_id, class_id, x, y, w, h, r, conf] (xywh are all normalized by width and height)
+    ### no r if not rotated, no conf if gt
+
     tl = 3  # line thickness
     tf = max(tl - 1, 1)  # font thickness
     if os.path.isfile(fname):  # do not overwrite
@@ -858,6 +1281,19 @@ def plot_images(images, targets, paths=None, fname='images.jpg', names=None, max
     if isinstance(targets, torch.Tensor):
         targets = targets.cpu().numpy()
 
+    # if len(targets.shape) <2:
+    #     # if gt:
+    #     #     print("This batch does not have any target")
+    #     #     print(targets)
+    #     # else:
+    #     #     print("This batch does not have any predicted targets")
+    #     #     print(targets)
+    #     #     ### this happens when output_to_target_r outputs a []
+                ### now it should not happen at all
+    #     return
+
+
+    rotated = targets.shape[1] == 7 if gt else targets.shape[1] == 8
     # un-normalise
     if np.max(images[0]) <= 1:
         images *= 255
@@ -894,22 +1330,38 @@ def plot_images(images, targets, paths=None, fname='images.jpg', names=None, max
 
         mosaic[block_y:block_y + h, block_x:block_x + w, :] = img
         if len(targets) > 0:
-            image_targets = targets[targets[:, 0] == i]
-            boxes = xywh2xyxy(image_targets[:, 2:6]).T
-            classes = image_targets[:, 1].astype('int')
-            gt = image_targets.shape[1] == 6  # ground truth if no conf column
-            conf = None if gt else image_targets[:, 6]  # check for confidence presence (gt vs pred)
+            image_targets = targets[targets[:, 0] == i].copy()
 
-            boxes[[0, 2]] *= w
-            boxes[[0, 2]] += block_x
-            boxes[[1, 3]] *= h
-            boxes[[1, 3]] += block_y
-            for j, box in enumerate(boxes.T):
-                cls = int(classes[j])
-                color = color_lut[cls % len(color_lut)]
-                cls = names[cls] if names else cls
-                if gt or conf[j] > 0.3:  # 0.3 conf thresh
-                    label = '%s' % cls if gt else '%s %.1f' % (cls, conf[j])
+            # if len(image_targets) <= 0:
+            #     print("current image does not have targets detected", i)
+            #     # print(targets)
+            #     # print(image_targets)
+            if len(image_targets) > 0:
+                
+                ### scaling should happen before rotation, if rotated
+                image_targets[:, [2,4]] *= w
+                image_targets[:, 2] += block_x
+                image_targets[:, [3,5]] *= h
+                image_targets[:, 3] += block_y
+
+                if rotated:
+                    boxes = xywh2xyxy_r(image_targets[:, 2:7]).T    # conf is the last dim so not included here # 8*n
+                    ### the return is n*8 xyxyxyxy
+                else:
+                    boxes = xywh2xyxy(image_targets[:, 2:6]).T  # T means now 4*n
+                classes = image_targets[:, 1].astype('int')
+                # gt = image_targets.shape[1] == 6  # ground truth if no conf column
+                conf = None if gt else image_targets[:, -1]  # check for confidence presence (gt vs pred)
+                
+                for j, box in enumerate(boxes.T):
+                    cls = int(classes[j])
+                    color = color_lut[cls % len(color_lut)]
+                    if names is not None and len(names) > 1:
+                        cls = names[cls] if names else cls
+                        # if gt or conf[j] > 0.3:  # 0.3 conf thresh    ## we do not use conf thresh here because the predictions are already filtered by nms
+                        label = '%s' % cls if gt else '%s %.1f' % (cls, conf[j])
+                    else:
+                        label = None if gt else '%.1f'%conf[j]
                     plot_one_box(box, mosaic, label=label, color=color, line_thickness=tl)
 
         # Draw image filename labels
@@ -1040,10 +1492,19 @@ def plot_results_overlay(start=0, stop=0):  # from utils.utils import *; plot_re
 
 def plot_results(start=0, stop=0, bucket='', id=()):  # from utils.utils import *; plot_results()
     # Plot training 'results*.txt' as seen in https://github.com/ultralytics/yolov3#training
-    fig, ax = plt.subplots(2, 5, figsize=(12, 6), tight_layout=True)
+    # fig, ax = plt.subplots(2, 5, figsize=(12, 6), tight_layout=True)
+    ### for compatible with rotated mode
+    # fig, ax = plt.subplots(2, 8, figsize=(20, 6), tight_layout=True)
+    fig, ax = plt.subplots(2, 7, figsize=(16, 6), tight_layout=True)
+    ### figsize is the overall size instead of subsize. This size times dpi at the end is the rendered figure size
     ax = ax.ravel()
-    s = ['GIoU', 'Objectness', 'Classification', 'Precision', 'Recall',
-         'val GIoU', 'val Objectness', 'val Classification', 'mAP@0.5', 'F1']
+    # s = ['GIoU', 'Objectness', 'Classification', 'Precision', 'Recall',
+    #      'val GIoU', 'val Objectness', 'val Classification', 'mAP@0.5', 'F1']
+    ### for compatible with rotated mode
+    # s = ['Box', 'Objectness', 'Classification', 'Position','Dimension','Direction', 'Precision', 'Recall',
+    #      'val Box', 'val Objectness', 'val Classification', 'val Position','val Dimension','val Direction', 'AP', 'F1']
+    s = ['Box', 'Objectness', 'Position','Dimension','Direction', 'Precision', 'Recall',
+         'val Box', 'val Objectness', 'val Position','val Dimension','val Direction', 'AP', 'F1']
     if bucket:
         os.system('rm -rf storage.googleapis.com')
         files = ['https://storage.googleapis.com/%s/results%g.txt' % (bucket, x) for x in id]
@@ -1051,15 +1512,27 @@ def plot_results(start=0, stop=0, bucket='', id=()):  # from utils.utils import 
         files = glob.glob('results*.txt') + glob.glob('../../Downloads/results*.txt')
     for f in sorted(files):
         try:
-            results = np.loadtxt(f, usecols=[2, 3, 4, 8, 9, 12, 13, 14, 10, 11], ndmin=2).T
+            # results = np.loadtxt(f, usecols=[2, 3, 4, 8, 9, 12, 13, 14, 10, 11], ndmin=2).T
+            ### for compatible with rotated mode
+            # results = np.loadtxt(f, usecols=[2, 3, 4, 5, 6, 7, 11, 12, 15, 16, 17, 18, 19, 20, 13, 14], ndmin=2).T
+            results = np.loadtxt(f, usecols=[2, 3, 5, 6, 7, 11, 12, 15, 16, 18, 19, 20, 13, 14], ndmin=2).T
+
             n = results.shape[1]  # number of rows
             x = range(start, min(stop, n) if stop else n)
-            for i in range(10):
+            # for i in range(10):
+            ### for compatible with rotated mode
+            # for i in range(16):
+            for i in range(14):
                 y = results[i, x]
-                if i in [0, 1, 2, 5, 6, 7]:
+                # if i in [0, 1, 2, 5, 6, 7]:
+                ### for compatible with rotated mode
+                # if i in [0, 1, 2, 8, 9, 10]:
+                if i in [0, 1, 8, 9]:
                     y[y == 0] = np.nan  # dont show zero loss values
                     # y /= y[0]  # normalize
-                ax[i].plot(x, y, marker='.', label=Path(f).stem, linewidth=2, markersize=8)
+                # y[y == 0] = np.nan  # dont show zero loss values
+                ax[i].plot(x, y, marker='.', label=Path(f).stem[8:], linewidth=2, markersize=8)
+                ### [8:] is to remove "results_" substring
                 ax[i].set_title(s[i])
                 # if i in [5, 6, 7]:  # share train and val loss y axes
                 #     ax[i].get_shared_y_axes().join(ax[i], ax[i - 5])
@@ -1067,4 +1540,5 @@ def plot_results(start=0, stop=0, bucket='', id=()):  # from utils.utils import 
             print('Warning: Plotting error for %s, skipping file' % f)
 
     ax[1].legend()
-    fig.savefig('results.png', dpi=200)
+    # fig.savefig('results.png', dpi=200)
+    fig.savefig('results.png', dpi=100)

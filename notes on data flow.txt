@@ -1,0 +1,24 @@
+inference output: [bs(4), -1, no=xywh,vx,vy,conf,class_confs(7+nc)] from one yolo layer
+reshaped from: [bs(4), n_anchors(3), nx(17,34,68), ny(13,26,52), 7+nc(7+1=8)]
+The inference output are unnormalized (ready-to-use values). All layer outputs are concated. 
+
+The training output dim 0,1 does not go through sigmoid (to [0,1]) and offset (to the global grid coordinate value) and stride (to global pixel coordinate value)
+The training output dim 2,3 does not go through exp (to (0, inf)) and scaling (to ratio with anchor size in grid) and stride (to ratio with anchor size in pixel)
+The training output dim 4,5 does not go through normalization (to [0,1])
+The training output of dim 6, ... does not go through sigmoid (to [0,1])
+The training output is a list with each element for a layer output. 
+
+Inference: 
+after nms: a list of [xywhr, conf, class], each item for an image in a batch
+output_to_target (input to plot_images): [batch_id, class_id, xywhr, conf], if gt then no conf. normalized again. (gt targets are normalized.)
+
+Training: 
+build_targets: 
+tbox is a list of [xywhr], each item for a layer, xy are unnormalized to grid and related to anchor xy grid (therefore between [0,1]), wh are unnormalized to grid.
+txy = tbox[..., [0,1]]
+twh = log(tbox[..., [2,3]]/anchors)
+
+targets from dataset: 
+n*7, [batch_id, class_id, xywhr]
+
+

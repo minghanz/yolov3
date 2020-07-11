@@ -42,6 +42,23 @@ hyp = {'giou': 3.54,  # giou loss gain
        'scale': 0.05 * 0,  # image scale (+/- gain)
        'shear': 0.641 * 0}  # image shear (+/- deg)
 
+hyp.update({
+    'xy': 4.062, 
+    'wh': 0.1845,
+    'r': 4.062 })#4.062
+    # {'giou': 1.008,  # giou loss gain
+    #    'xy': 4.062,  # xy loss gain
+    #    'wh': 0.1845,  # wh loss gain
+    #    'cls': 16.94,  # cls loss gain
+    #    'cls_pw': 6.215,  # cls BCELoss positive_weight
+    #    'obj': 10.61,  # obj loss gain
+    #    'obj_pw': 4.272,  # obj BCELoss positive_weight
+    #    'iou_t': 0.251,  # iou target-anchor training threshold
+    #    'lr0': 0.001,  # initial learning rate
+    #    'lrf': -4.,  # final learning rate = lr0 * (10 ** lrf)
+    #    'momentum': 0.90,  # SGD momentum
+    #    'weight_decay': 0.0005}  # optimizer weight decay
+
 # Overwrite hyp with hyp*.txt (optional)
 f = glob.glob('hyp*.txt')
 if f:
@@ -55,6 +72,7 @@ if hyp['fl_gamma']:
 
 
 def train(hyp):
+    torch.cuda.empty_cache()        # in case previously run application is exited abnormally without clearing the cache in GPU memory
     cfg = opt.cfg
     data = opt.data
     epochs = opt.epochs  # 500200 batches at bs 64, 117263 images = 273 epochs
@@ -63,8 +81,12 @@ def train(hyp):
     weights = opt.weights  # initial training weights
     imgsz_min, imgsz_max, imgsz_test = opt.img_size  # img sizes (min, max, test)
 
+    rotated = opt.rotated
+    rotated_anchor = opt.rotated_anchor
+    half_angle = opt.half_angle
+
     # Image Sizes
-    gs = 64  # (pixels) grid size
+    gs = 32 # 64  # (pixels) grid size
     assert math.fmod(imgsz_min, gs) == 0, '--img-size %g must be a %g-multiple' % (imgsz_min, gs)
     opt.multi_scale |= imgsz_min != imgsz_max  # multi if different (min, max)
     if opt.multi_scale:
@@ -88,7 +110,7 @@ def train(hyp):
         os.remove(f)
 
     # Initialize model
-    model = Darknet(cfg).to(device)
+    model = Darknet(cfg, rotated=rotated).to(device)
 
     # Optimizer
     pg0, pg1, pg2 = [], [], []  # optimizer parameter groups
@@ -180,7 +202,9 @@ def train(hyp):
                                   hyp=hyp,  # augmentation hyperparameters
                                   rect=opt.rect,  # rectangular training
                                   cache_images=opt.cache_images,
-                                  single_cls=opt.single_cls)
+                                  single_cls=opt.single_cls, 
+                                  rotated=rotated, 
+                                  half_angle=half_angle)
 
     # Dataloader
     batch_size = min(batch_size, len(dataset))
@@ -197,7 +221,9 @@ def train(hyp):
                                                                  hyp=hyp,
                                                                  rect=True,
                                                                  cache_images=opt.cache_images,
-                                                                 single_cls=opt.single_cls),
+                                                                 single_cls=opt.single_cls, 
+                                                                 rotated=rotated, 
+                                                                 half_angle=half_angle), 
                                              batch_size=batch_size,
                                              num_workers=nw,
                                              pin_memory=True,
@@ -222,6 +248,47 @@ def train(hyp):
     print('Image sizes %g - %g train, %g test' % (imgsz_min, imgsz_max, imgsz_test))
     print('Using %g dataloader workers' % nw)
     print('Starting training for %g epochs...' % epochs)
+
+    # # Process epoch results before training
+    # ema.update_attr(model)
+    # final_epoch = False
+    # if not opt.notest or final_epoch:  # Calculate mAP
+    #     is_coco = any([x in data for x in ['coco.data', 'coco2014.data', 'coco2017.data']]) and model.nc == 80
+    #     results, maps = test.test(cfg,
+    #                                   data,
+    #                                   batch_size=batch_size,
+    #                                   imgsz=imgsz_test,
+    #                                   model=ema.ema,
+    #                                   save_json=final_epoch and is_coco,
+    #                                   single_cls=opt.single_cls,
+    #                                   dataloader=testloader,
+    #                                   multi_label=False, 
+    #                                   rotated=rotated, 
+    #                                   conf_thres=0.1, 
+    #                                   iou_thres=0.2,
+    #                                   id=-1, 
+    #                                   rotated_anchor=rotated_anchor, 
+    #                                   half_angle=half_angle )
+    #     print("results", results)
+    #     print("len(results)", len(results))
+    #     s = ('%10s' * 2 + '%10.3g' * 9) % ('%g/%g' % (0, 0 - 1), 0, *torch.zeros(7), 0, 0)  # 6 changed to 9 because rbbox produces lxy, lwh, lr
+    #     with open(results_file, 'a') as f:
+    #         # f.write(s + '%10.3g' * 7 % results + '\n')  # P, R, mAP, F1, test_losses=(GIoU, obj, cls)
+    #         f.write(s + '%10.3g' * 10 % results + '\n')  # P, R, mAP, F1, test_losses=(GIoU, obj, cls, lxy, lwh, lr) to be compatible with rotated case
+
+    #     fi = fitness(np.array(results).reshape(1, -1))  # fitness_i = weighted combination of [P, R, mAP, F1]
+    #     print("fi", fi)
+    #     print("best_fitness",best_fitness)
+    #     if fi > best_fitness:
+    #         best_fitness = fi
+    #         print("should save")
+    #     if (best_fitness == fi) and not final_epoch:
+    #         print("saving")
+    #         torch.save(chkpt, best)
+
+    with open(results_file, 'a') as f:  
+        f.write('%10s' * (11+10) % ('epochs', 'mem_cache', 'lbox', 'lobj', 'lcls', 'lxy', 'lwh', 'lr', 'tot_loss', 'n_targets', 'longside', 'test:mP', 'mR', 'mAP', 'mF1', 'lbox', 'lobj', 'lcls', 'lxy', 'lwh', 'lr')+'\n')
+
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         model.train()
 
@@ -231,8 +298,10 @@ def train(hyp):
             image_weights = labels_to_image_weights(dataset.labels, nc=nc, class_weights=w)
             dataset.indices = random.choices(range(dataset.n), weights=image_weights, k=dataset.n)  # rand weighted idx
 
-        mloss = torch.zeros(4).to(device)  # mean losses
-        print(('\n' + '%10s' * 8) % ('Epoch', 'gpu_mem', 'GIoU', 'obj', 'cls', 'total', 'targets', 'img_size'))
+        # mloss = torch.zeros(4).to(device)  # mean losses
+        mloss = torch.zeros(7).to(device)  # mean losses    # to be compatible with rotated cases
+        # print(('\n' + '%10s' * 8) % ('Epoch', 'gpu_mem', 'GIoU', 'obj', 'cls', 'total', 'targets', 'img_size'))
+        print(('\n' + '%10s' * 11) % ('Epoch', 'gpu_mem', 'GIoU', 'obj', 'cls', 'xy', 'wh', 'r', 'total', 'targets', 'img_size'))
         pbar = tqdm(enumerate(dataloader), total=nb)  # progress bar
         for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
             ni = i + nb * epoch  # number integrated batches (since train start)
@@ -264,7 +333,7 @@ def train(hyp):
             pred = model(imgs)
 
             # Loss
-            loss, loss_items = compute_loss(pred, targets, model)
+            loss, loss_items = compute_loss(pred, targets, model, half_angle=half_angle)
             if not torch.isfinite(loss):
                 print('WARNING: non-finite loss, ending training ', loss_items)
                 return results
@@ -286,7 +355,10 @@ def train(hyp):
             # Print
             mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
             mem = '%.3gG' % (torch.cuda.memory_cached() / 1E9 if torch.cuda.is_available() else 0)  # (GB)
-            s = ('%10s' * 2 + '%10.3g' * 6) % ('%g/%g' % (epoch, epochs - 1), mem, *mloss, len(targets), img_size)
+            # s = ('%10s' * 2 + '%10.3g' * 6) % ('%g/%g' % (epoch, epochs - 1), mem, *mloss, len(targets), img_size) # 2 + 4 + 2
+            s = ('%10s' * 2 + '%10.3g' * 9) % ('%g/%g' % (epoch, epochs - 1), mem, *mloss, len(targets), img_size)  # 6 changed to 9 because rbbox produces lxy, lwh, lr # 2 + 7 + 2
+            # mloss=(lbox, lobj, lcls, loss) originally
+            # mloss=(lbox, lobj, lcls, lxy, lwh, lr, loss) to be compatible with rbox
             pbar.set_description(s)
 
             # Plot
@@ -315,15 +387,24 @@ def train(hyp):
                                       save_json=final_epoch and is_coco,
                                       single_cls=opt.single_cls,
                                       dataloader=testloader,
-                                      multi_label=ni > n_burn)
+                                      multi_label=ni > n_burn, 
+                                      rotated=rotated, 
+                                      conf_thres=0.1, 
+                                      iou_thres=0.2,
+                                      id=epoch, 
+                                      rotated_anchor=rotated_anchor, 
+                                      half_angle=half_angle )
 
         # Write
+        ### s is from training, as an updated average of the whole epoch
         with open(results_file, 'a') as f:
-            f.write(s + '%10.3g' * 7 % results + '\n')  # P, R, mAP, F1, test_losses=(GIoU, obj, cls)
+            # f.write(s + '%10.3g' * 7 % results + '\n')  # P, R, mAP, F1, test_losses=(GIoU, obj, cls)
+            f.write(s + '%10.3g' * 10 % results + '\n')  # P, R, mAP, F1, test_losses=(GIoU, obj, cls, lxy, lwh, lr) to be compatible with rotated case
         if len(opt.name) and opt.bucket:
             os.system('gsutil cp results.txt gs://%s/results/results%s.txt' % (opt.bucket, opt.name))
 
         # Tensorboard
+        ### mloss is training losses, results are testing quantitative evaluation and losses
         if tb_writer:
             tags = ['train/giou_loss', 'train/obj_loss', 'train/cls_loss',
                     'metrics/precision', 'metrics/recall', 'metrics/mAP_0.5', 'metrics/F1',
@@ -394,6 +475,10 @@ if __name__ == '__main__':
     parser.add_argument('--device', default='', help='device id (i.e. 0 or 0,1 or cpu)')
     parser.add_argument('--adam', action='store_true', help='use adam optimizer')
     parser.add_argument('--single-cls', action='store_true', help='train as single-class dataset')
+    parser.add_argument('--rotated', action='store_true', help='use rotated bbox instead of axis-aligned ones')
+    parser.add_argument('--rotated-anchor', action='store_true', help='use residual yaw w.r.t. anchors instead of regressing the original angle')
+    parser.add_argument('--half-angle', action='store_true', help='use 180 degree instead of 360 degree in direction estimation (forward-backward equivalent)')
+    
     opt = parser.parse_args()
     opt.weights = last if opt.resume else opt.weights
     check_git_status()

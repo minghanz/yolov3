@@ -20,7 +20,16 @@ def test(cfg,
          augment=False,
          model=None,
          dataloader=None,
-         multi_label=True):
+         multi_label=True, 
+         rotated=False,
+         rotated_anchor=False, 
+         half_angle=False,
+         id=0, 
+         output_path=None):
+    ### opt is accessible only when called in this script itself, where opt is declared outside of functions, therefore a global variable
+    ### you are also able to change members in opt, since opt is a mutable object. You cannot modify an immutable object as a global variable in a function, except you declare it as global first in the function. 
+    ### https://stackoverflow.com/questions/31435603/python-modify-global-list-inside-a-function
+    
     # Initialize/load model and set device
     if model is None:
         device = torch_utils.select_device(opt.device, batch_size=batch_size)
@@ -31,7 +40,7 @@ def test(cfg,
             os.remove(f)
 
         # Initialize model
-        model = Darknet(cfg, imgsz)
+        model = Darknet(cfg, imgsz, rotated=rotated)
 
         # Load weights
         attempt_download(weights)
@@ -56,12 +65,15 @@ def test(cfg,
     path = data['valid']  # path to test images
     names = load_classes(data['names'])  # class names
     iouv = torch.linspace(0.5, 0.95, 10).to(device)  # iou vector for mAP@0.5:0.95
+    # iouv = torch.linspace(0.2, 0.95, 10).to(device)  # iou vector for mAP@0.5:0.95
     iouv = iouv[0].view(1)  # comment for mAP@0.5:0.95
     niou = iouv.numel()
+    print("niou:", niou)
+    print("iouv:", iouv)
 
     # Dataloader
     if dataloader is None:
-        dataset = LoadImagesAndLabels(path, imgsz, batch_size, rect=True, single_cls=opt.single_cls)
+        dataset = LoadImagesAndLabels(path, imgsz, batch_size, rect=True, single_cls=opt.single_cls, rotated=rotated, half_angle=half_angle)
         batch_size = min(batch_size, len(dataset))
         dataloader = DataLoader(dataset,
                                 batch_size=batch_size,
@@ -75,7 +87,15 @@ def test(cfg,
     coco91class = coco80_to_coco91_class()
     s = ('%20s' + '%10s' * 6) % ('Class', 'Images', 'Targets', 'P', 'R', 'mAP@0.5', 'F1')
     p, r, f1, mp, mr, map, mf1, t0, t1 = 0., 0., 0., 0., 0., 0., 0., 0., 0.
-    loss = torch.zeros(3, device=device)
+    # loss = torch.zeros(3, device=device)
+    loss = torch.zeros(6, device=device)       ### to be compatible with rotated bbox, the loss contains 6 terms (adding lxy, lwh, lr)
+
+    if rotated:
+        cls_idx = 6
+        conf_idx = 5
+    else:
+        cls_idx = 5
+        conf_idx = 4
     jdict, stats, ap, ap_class = [], [], [], []
     for batch_i, (imgs, targets, paths, shapes) in enumerate(tqdm(dataloader, desc=s)):
         imgs = imgs.to(device).float() / 255.0  # uint8 to float32, 0 - 255 to 0.0 - 1.0
@@ -92,11 +112,12 @@ def test(cfg,
 
             # Compute loss
             if hasattr(model, 'hyp'):  # if model has loss hyperparameters
-                loss += compute_loss(train_out, targets, model)[1][:3]  # GIoU, obj, cls
+                # loss += compute_loss(train_out, targets, model)[1][:3]  # GIoU, obj, cls
+                loss += compute_loss(train_out, targets, model, half_angle=half_angle)[1][:6]  # GIoU, obj, cls, xy, wh, rotation (rotated or not)
 
             # Run NMS
             t = torch_utils.time_synchronized()
-            output = non_max_suppression(inf_out, conf_thres=conf_thres, iou_thres=iou_thres, multi_label=multi_label)
+            output = non_max_suppression(inf_out, conf_thres=conf_thres, iou_thres=iou_thres, multi_label=multi_label, rotated=rotated, rotated_anchor=rotated_anchor)
             t1 += torch_utils.time_synchronized() - t
 
         # Statistics per image
@@ -115,22 +136,28 @@ def test(cfg,
             # with open('test.txt', 'a') as file:
             #    [file.write('%11.5g' * 7 % tuple(x) + '\n') for x in pred]
 
-            # Clip boxes to image bounds
-            clip_coords(pred, (height, width))
+            if not rotated:
+                # Clip boxes to image bounds
+                clip_coords(pred, (height, width))
 
             # Append to pycocotools JSON dictionary
             if save_json:
                 # [{"image_id": 42, "category_id": 18, "bbox": [258.15, 41.29, 348.26, 243.78], "score": 0.236}, ...
                 image_id = int(Path(paths[si]).stem.split('_')[-1])
-                box = pred[:, :4].clone()  # xyxy
-                scale_coords(imgs[si].shape[1:], box, shapes[si][0], shapes[si][1])  # to original shape
-                box = xyxy2xywh(box)  # xywh
-                box[:, :2] -= box[:, 2:] / 2  # xy center to top-left corner
+                if not rotated:
+                    box = pred[:, :4].clone()  # xyxy
+                    scale_coords(imgs[si].shape[1:], box, shapes[si][0], shapes[si][1])  # to original shape
+                    box = xyxy2xywh(box)  # xywh
+                    box[:, :2] -= box[:, 2:] / 2  # xy center to top-left corner
+                else:
+                    box = pred[:, :5].clone() # xywhr
+                    scale_coords_r(imgs[si].shape[1:], box, shapes[si][0], shapes[si][1])
+
                 for p, b in zip(pred.tolist(), box.tolist()):
                     jdict.append({'image_id': image_id,
-                                  'category_id': coco91class[int(p[5])],
+                                  'category_id': coco91class[int(p[cls_idx])],
                                   'bbox': [round(x, 3) for x in b],
-                                  'score': round(p[4], 5)})
+                                  'score': round(p[conf_idx], 5)})
 
             # Assign all predictions as incorrect
             correct = torch.zeros(pred.shape[0], niou, dtype=torch.bool, device=device)
@@ -138,18 +165,30 @@ def test(cfg,
                 detected = []  # target indices
                 tcls_tensor = labels[:, 0]
 
-                # target boxes
-                tbox = xywh2xyxy(labels[:, 1:5]) * whwh
+                if not rotated:
+                    # target boxes
+                    tbox = xywh2xyxy(labels[:, 1:5]) * whwh # xyxy
+                else:
+                    tbox = labels[:, 1:6]
+                    tbox[:, :4] = tbox[:, :4] * whwh        # xywhr
 
                 # Per target class
                 for cls in torch.unique(tcls_tensor):
                     ti = (cls == tcls_tensor).nonzero().view(-1)  # prediction indices
-                    pi = (cls == pred[:, 5]).nonzero().view(-1)  # target indices
+                    pi = (cls == pred[:, cls_idx]).nonzero().view(-1)  # target indices
 
                     # Search for detections
                     if pi.shape[0]:
                         # Prediction to target ious
-                        ious, i = box_iou(pred[pi, :4], tbox[ti]).max(1)  # best ious, indices
+                        if not rotated:
+                            ious, i = box_iou(pred[pi, :4], tbox[ti]).max(1)  # best ious, indices
+                        else:
+                            # ious, i = d3d.box.box2d_iou(pred[pi, :5], tbox[ti], method="rbox").max(1)
+                            ious, i = lin_iou(pred[pi, :5], tbox[ti]).max(1)
+                            # print(ious.shape)
+                            # print("ious.max()", ious.max())
+                            # print("ious.min()", ious.min())
+                            
 
                         # Append detections
                         for j in (ious > iouv[0]).nonzero():
@@ -161,22 +200,42 @@ def test(cfg,
                                     break
 
             # Append statistics (correct, conf, pcls, tcls)
-            stats.append((correct.cpu(), pred[:, 4].cpu(), pred[:, 5].cpu(), tcls))
+            stats.append((correct.cpu(), pred[:, conf_idx].cpu(), pred[:, cls_idx].cpu(), tcls))
 
         # Plot images
-        if batch_i < 1:
+        if batch_i < 5:
             f = 'test_batch%g_gt.jpg' % batch_i  # filename
             plot_images(imgs, targets, paths=paths, names=names, fname=f)  # ground truth
-            f = 'test_batch%g_pred.jpg' % batch_i
-            plot_images(imgs, output_to_target(output, width, height), paths=paths, names=names, fname=f)  # predictions
+            f = 'test_batch%g_pred%d.jpg' % (batch_i, id)
+            if not rotated:
+                plot_images(imgs, output_to_target(output, width, height), paths=paths, names=names, fname=f, gt=False)  # predictions
+            else:
+                plot_images(imgs, output_to_target_r(output, width, height), paths=paths, names=names, fname=f, gt=False)  # predictions
 
     # Compute statistics
     stats = [np.concatenate(x, 0) for x in zip(*stats)]  # to numpy
     if len(stats):
         p, r, ap, f1, ap_class = ap_per_class(*stats)
+        ### above output dim0: w.r.t. class, dim1: w.r.t. iou_threshold
+        ### confidence threshold for P,R,F1 is set to a single point, see inside ap_per_class(). AP is irrelevant to confidence threshold since it is the region ratio. 
+        # if niou > 1:
+        #     p, r, ap, f1 = p[:, 0], r[:, 0], ap.mean(1), ap[:, 0]  # [P, R, AP@0.5:0.95, AP@0.5]
+        #     ### index 0 at dim1 means taking iouv[0] as the iou threshold
+        #     ### TODO: notice that above f1 is allocated by ap@0.5 instead of real f1
+        # if niou > 1:
+        #     p, r, ap, f1 = p[:, 0], r[:, 0], ap[:, 0], f1[:, 0]  # [P, R, AP@0.5:0.95, AP@0.5]
+        #     ### index 0 at dim1 means taking iouv[0] as the iou threshold for all thresholds
         if niou > 1:
-            p, r, ap, f1 = p[:, 0], r[:, 0], ap.mean(1), ap[:, 0]  # [P, R, AP@0.5:0.95, AP@0.5]
+            # p, r, ap, f1 = p.mean(1), r.mean(1), ap.mean(1), f1.mean(1)  # [P, R, AP@0.5:0.95, AP@0.5]
+            mp_iou, mr_iou, map_iou, mf1_iou = p.mean(1), r.mean(1), ap.mean(1), f1.mean(1)  # [P, R, AP@0.5:0.95, AP@0.5]
+            ### take average over iou_thresholds
+        else:
+            mp_iou, mr_iou, map_iou, mf1_iou = p, r, ap, f1
+
+        mp_cls, mr_cls, map_cls, mf1_cls = p.mean(0), r.mean(0), ap.mean(0), f1.mean(0)  # [P, R, AP@0.5:0.95, AP@0.5]
+        
         mp, mr, map, mf1 = p.mean(), r.mean(), ap.mean(), f1.mean()
+        ### the above mean is over classes
         nt = np.bincount(stats[3].astype(np.int64), minlength=nc)  # number of targets per class
     else:
         nt = torch.zeros(1)
@@ -188,12 +247,41 @@ def test(cfg,
     # Print results per class
     if verbose and nc > 1 and len(stats):
         for i, c in enumerate(ap_class):
-            print(pf % (names[c], seen, nt[c], p[i], r[i], ap[i], f1[i]))
+            # print(pf % (names[c], seen, nt[c], p[i], r[i], ap[i], f1[i]))
+            print(pf % (names[c], seen, nt[c], mp_iou[i], mr_iou[i], map_iou[i], mf1_iou[i]))
 
     # Print speeds
     if verbose or save_json:
         t = tuple(x / seen * 1E3 for x in (t0, t1, t0 + t1)) + (imgsz, imgsz, batch_size)  # tuple
         print('Speed: %.1f/%.1f/%.1f ms inference/NMS/total per %gx%g image at batch-size %g' % t)
+
+    ### save the evaluation result to txt
+    if output_path is not None:
+        with open(output_path, "a") as f:
+            result_dict = {}
+            result_dict["PR_conf_thresh(except AP)"] = 0.1 # see ap_per_class class
+            result_dict["iou_thresh"] = iouv.tolist()
+            result_dict["n_images"] = seen
+            result_dict["n_targets"] = nt.sum().item()
+            result_dict["mP_cls"] = mp_cls.tolist()
+            result_dict["mR_cls"] = mr_cls.tolist()
+            result_dict["mF1_cls"] = mf1_cls.tolist()
+            result_dict["mAP_cls"] = map_cls.tolist()
+            result_dict["mP"] = mp.item()
+            result_dict["mR"] = mr.item()
+            result_dict["mF1"] = mf1.item()
+            result_dict["mAP"] = map.item()
+            json.dump(result_dict, f, indent=2)
+            f.write("\n")
+            speed_dict = {}
+            speed_dict["inference"] = t0 *1e3 / seen
+            speed_dict["NMS"] = t1 *1e3 / seen
+            speed_dict["total"] = (t0+t1) *1e3 / seen
+            speed_dict["imgsz_long"] = imgsz
+            speed_dict["batch_size"] = batch_size
+            json.dump(speed_dict, f, indent=2)
+            f.write("\n")
+            # print('Speed: %.1f/%.1f/%.1f ms inference/NMS/total per %gx%g image at batch-size %g\n' % t, file=f)            
 
     # Save JSON
     if save_json and map and len(jdict):
@@ -223,7 +311,7 @@ def test(cfg,
     # Return results
     maps = np.zeros(nc) + map
     for i, c in enumerate(ap_class):
-        maps[c] = ap[i]
+        maps[c] = map_iou[i] # ap[i]
     return (mp, mr, map, mf1, *(loss.cpu() / len(dataloader)).tolist()), maps
 
 
@@ -241,11 +329,24 @@ if __name__ == '__main__':
     parser.add_argument('--device', default='', help='device id (i.e. 0 or 0,1) or cpu')
     parser.add_argument('--single-cls', action='store_true', help='train as single-class dataset')
     parser.add_argument('--augment', action='store_true', help='augmented inference')
+    parser.add_argument('--rotated', action='store_true', help='use rotated bbox instead of axis-aligned ones')
+    parser.add_argument('--rotated-anchor', action='store_true', help='use residual yaw w.r.t. anchors instead of regressing the original angle')
+    parser.add_argument('--save-txt', action='store_true', help='save evaluation quantitative results to *.txt')
     opt = parser.parse_args()
     opt.save_json = opt.save_json or any([x in opt.data for x in ['coco.data', 'coco2014.data', 'coco2017.data']])
     opt.cfg = list(glob.iglob('./**/' + opt.cfg, recursive=True))[0]  # find file
     opt.data = list(glob.iglob('./**/' + opt.data, recursive=True))[0]  # find file
     print(opt)
+
+    ### save arguments to file
+    if opt.save_txt:
+        output_path = "test_result_d_{}_w_{}.txt".format(opt.data.split("/")[-1].split(".")[0], opt.weights.split("/")[-1].split(".")[0])
+        with open(output_path, "w") as f:
+            to_save = opt.__dict__.copy()
+            json.dump(to_save, f, indent=2)
+            f.write('\n')
+    else:
+        output_path=None
 
     # task = 'test', 'study', 'benchmark'
     if opt.task == 'test':  # (default) test normally
@@ -258,7 +359,10 @@ if __name__ == '__main__':
              opt.iou_thres,
              opt.save_json,
              opt.single_cls,
-             opt.augment)
+             opt.augment, 
+             rotated=opt.rotated, 
+             rotated_anchor=opt.rotated_anchor, 
+             output_path=output_path)
 
     elif opt.task == 'benchmark':  # mAPs at 256-640 at conf 0.5 and 0.7
         y = []

@@ -11,6 +11,10 @@ def detect(save_img=False):
     out, source, weights, half, view_img, save_txt = opt.output, opt.source, opt.weights, opt.half, opt.view_img, opt.save_txt
     webcam = source == '0' or source.startswith('rtsp') or source.startswith('http') or source.endswith('.txt')
 
+    rotated = opt.rotated
+    rotated_anchor = opt.rotated_anchor
+    single_cls = opt.single_cls
+
     # Initialize
     device = torch_utils.select_device(device='cpu' if ONNX_EXPORT else opt.device)
     if os.path.exists(out):
@@ -18,7 +22,7 @@ def detect(save_img=False):
     os.makedirs(out)  # make new output folder
 
     # Initialize model
-    model = Darknet(opt.cfg, imgsz)
+    model = Darknet(opt.cfg, imgsz, rotated=rotated)
 
     # Load weights
     attempt_download(weights)
@@ -74,14 +78,16 @@ def detect(save_img=False):
     names = load_classes(opt.names)
     colors = [[random.randint(0, 255) for _ in range(3)] for _ in range(len(names))]
 
-    # Get name indices
-    name_indices = cvt2coco(opt.names)
+    if not single_cls:
+        # Get name indices
+        name_indices = cvt2coco(opt.names)
 
     # Run inference
     t0 = time.time()
     img = torch.zeros((1, 3, imgsz, imgsz), device=device)  # init img
     _ = model(img.half() if half else img.float()) if device.type != 'cpu' else None  # run once
-    for path, img, im0s, vid_cap in dataset:
+    for frame_i, (path, img, im0s, vid_cap) in enumerate(dataset):
+    # for path, img, im0s, vid_cap in dataset:
         img = torch.from_numpy(img).to(device)
         img = img.half() if half else img.float()  # uint8 to fp16/32
         img /= 255.0  # 0 - 255 to 0.0 - 1.0
@@ -99,7 +105,7 @@ def detect(save_img=False):
 
         # Apply NMS
         pred = non_max_suppression(pred, opt.conf_thres, opt.iou_thres,
-                                   multi_label=False, classes=opt.classes, agnostic=opt.agnostic_nms)
+                                   multi_label=False, classes=opt.classes, agnostic=opt.agnostic_nms, rotated=rotated, rotated_anchor=rotated_anchor)
 
         # Apply Classifier
         if classify:
@@ -119,25 +125,47 @@ def detect(save_img=False):
                 # Rescale boxes from imgsz to im0 size
                 det[:, :4] = scale_coords(img.shape[2:], det[:, :4], im0.shape).round()
 
-                # Print results
-                for c in det[:, -1].unique():
-                    if c not in name_indices:
-                        continue
-                    n = (det[:, -1] == c).sum()  # detections per class
-                    s += '%g %ss, ' % (n, names[int(name_indices[c])])  # add to string
+                if not single_cls:
+                    ### the class id (c) are with original coco defs. Therefore we need to map the coco class id to the class id in the input .names file
+                    # Print results
+                    for c in det[:, -1].unique():
+                        if c not in name_indices:
+                            continue
+                        n = (det[:, -1] == c).sum()  # detections per class
+                        s += '%g %ss, ' % (n, names[int(name_indices[c])])  # add to string
 
                 # Write results
                 for *xyxy, conf, cls in det:
-                    if int(cls) not in name_indices:
-                        continue
+                    if not single_cls:
+                        if int(cls) not in name_indices:
+                            continue
                     if save_txt:  # Write to file
-                        xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
-                        with open(save_path[:save_path.rfind('.')] + '.txt', 'a') as file:
-                            file.write(('%g ' * 5 + '\n') % (cls, *xywh))  # label format
+                        if not rotated:
+                            xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
+                            with open(save_path[:save_path.rfind('.')] + '.txt', 'a') as file:
+                                # file.write(('%g ' * 5 + '\n') % (cls, *xywh))  # label format
+                                # file.write(('%g ' * 6 + '\n') % (frame_i, cls, *xywh))  # label format with frame_i
+                                file.write(('%g ' * 7 + '\n') % (frame_i, *xyxy, cls, conf))  # label format with conf, write xyxy
+                        else:
+                            xyxy_np = torch.tensor(xyxy).numpy()[None]
+                            xyxy_8 = xywh2xyxy_r(xyxy_np)[0]
+                            with open(save_path[:save_path.rfind('.')] + '.txt', 'a') as file:
+                                # file.write(('%g ' * 6 + '\n') % (cls, *xyxy))  # actually xyxy are xywhr
+                                file.write(('%g ' * 8 + '\n') % (frame_i, *xyxy, cls, conf))  # frame_number, xywhr, class, confidence
+                                # file.write(('%g ' * 10 + '\n') % (frame_i, cls, *xyxy_8))  # save point coordinate for easier visualization later
 
                     if save_img or view_img:  # Add bbox to image
-                        label = '%s %.2f' % (names[int(name_indices[int(cls)])], conf)
-                        plot_one_box(xyxy, im0, label=label, color=colors[int(name_indices[int(cls)])])
+                        if not rotated:
+                            label = '%s %.2f' % (names[int(name_indices[int(cls)])], conf)
+                            plot_one_box(xyxy, im0, label=label, color=colors[int(name_indices[int(cls)])])
+                        else:
+                            if not single_cls:
+                            # if names is not None and len(names) > 1:
+                                cls_name = names[int(cls)] if names else int(cls)
+                                label = '%s %.1f' % (cls_name, conf)
+                            else:
+                                label = '%.1f' % conf
+                            plot_one_box(xyxy_8, im0, label=label, color=colors[int(cls)])
 
             # Print time (inference + NMS)
             print('%sDone. (%.3fs)' % (s, t2 - t1))
@@ -190,6 +218,10 @@ if __name__ == '__main__':
     parser.add_argument('--classes', nargs='+', type=int, help='filter by class')
     parser.add_argument('--agnostic-nms', action='store_true', help='class-agnostic NMS')
     parser.add_argument('--augment', action='store_true', help='augmented inference')
+
+    parser.add_argument('--single-cls', action='store_true', help='train as single-class dataset')
+    parser.add_argument('--rotated', action='store_true', help='use rotated bbox instead of axis-aligned ones')
+    parser.add_argument('--rotated-anchor', action='store_true', help='use residual yaw w.r.t. anchors instead of regressing the original angle')
     opt = parser.parse_args()
     opt.cfg = list(glob.iglob('./**/' + opt.cfg, recursive=True))[0]  # find file
     opt.names = list(glob.iglob('./**/' + opt.names, recursive=True))[0]  # find file

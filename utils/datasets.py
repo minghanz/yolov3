@@ -14,7 +14,7 @@ from PIL import Image, ExifTags
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
-from utils.utils import xyxy2xywh, xywh2xyxy
+from utils.utils import xyxy2xywh, xywh2xyxy, xywh2xyxy_r
 
 help_url = 'https://github.com/ultralytics/yolov3/wiki/Train-Custom-Data'
 img_formats = ['.bmp', '.jpg', '.jpeg', '.png', '.tif', '.dng']
@@ -257,7 +257,7 @@ class LoadStreams:  # multiple IP or RTSP cameras
 
 class LoadImagesAndLabels(Dataset):  # for training/testing
     def __init__(self, path, img_size=416, batch_size=16, augment=False, hyp=None, rect=False, image_weights=False,
-                 cache_images=False, single_cls=False):
+                 cache_images=False, single_cls=False, rotated=False, half_angle=False):
         try:
             path = str(Path(path))  # os-agnostic
             if os.path.isfile(path):  # file
@@ -282,6 +282,9 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         self.image_weights = image_weights
         self.rect = False if image_weights else rect
         self.mosaic = self.augment and not self.rect  # load 4 images at a time into a mosaic (only during training)
+        self.rotated = rotated
+        self.half_angle = half_angle
+        ### for rotated bbox training, turn on rect to disable mosaic training!!!, set the long side using img_size, and short side will be padded to min 32x
 
         # Define labels
         self.label_files = [x.replace('images', 'labels').replace(os.path.splitext(x)[-1], '.txt')
@@ -318,11 +321,15 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 elif mini > 1:
                     shapes[i] = [1, 1 / mini]
 
-            self.batch_shapes = np.ceil(np.array(shapes) * img_size / 64.).astype(np.int) * 64
+            # self.batch_shapes = np.ceil(np.array(shapes) * img_size / 64.).astype(np.int) * 64
+            self.batch_shapes = np.ceil(np.array(shapes) * img_size / 32.).astype(np.int) * 32 ### see gs in train.py
 
         # Cache labels
         self.imgs = [None] * n
-        self.labels = [np.zeros((0, 5), dtype=np.float32)] * n
+        if self.rotated:
+            self.labels = [np.zeros((0, 6), dtype=np.float32)] * n
+        else:
+            self.labels = [np.zeros((0, 5), dtype=np.float32)] * n
         create_datasubset, extract_bounding_boxes, labels_loaded = False, False, False
         nm, nf, ne, ns, nd = 0, 0, 0, 0, 0  # number missing, found, empty, datasubset, duplicate
         np_labels_path = str(Path(self.label_files[0]).parent) + '.npy'  # saved labels in *.npy file
@@ -348,13 +355,27 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                     continue
 
             if l.shape[0]:
-                assert l.shape[1] == 5, '> 5 label columns: %s' % file
-                assert (l >= 0).all(), 'negative labels: %s' % file
-                assert (l[:, 1:] <= 1).all(), 'non-normalized or out of bounds coordinate labels: %s' % file
+                if self.rotated:
+                    assert l.shape[1] in [5,6], '%d label columns while 6 are required: %s' % (l.shape[1], file)
+                    assert (l[:,:5] >= 0).all(), 'negative labels: %s' % file
+                    assert (l[:, 1:5] <= 1).all(), 'non-normalized or out of bounds coordinate labels: %s' % file
+                    if l.shape[1] == 5:
+                        l = np.concatenate((l, np.zeros((l.shape[0], 1))), axis=1) ## add a virtual yaw dim
+                else:
+                    assert l.shape[1] in [5, 6], '%d label columns while 5 are required: %s' % (l.shape[1], file)
+                    assert (l[:, :5] >= 0).all(), 'negative labels: %s' % file
+                    assert (l[:, 1:5] <= 1).all(), 'non-normalized or out of bounds coordinate labels: %s' % file
+                    if l.shape[1] == 6:
+                        l = l[:, :5] ## delete the yaw dim
+
                 if np.unique(l, axis=0).shape[0] < l.shape[0]:  # duplicate rows
                     nd += 1  # print('WARNING: duplicate rows in %s' % self.label_files[i])  # duplicate rows
                 if single_cls:
                     l[:, 0] = 0  # force dataset into single-class mode
+                if self.rotated and self.half_angle:    
+                    ### so that the gt angle is between 0 and pi (later there may be augmentation so it could still go out of the range, but it's fine) 
+                    l[l[:, 5]<0, 5] += math.pi
+
                 self.labels[i] = l
                 nf += 1  # file found
 
@@ -380,10 +401,20 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                         if not os.path.exists(Path(f).parent):
                             os.makedirs(Path(f).parent)  # make new output folder
 
-                        b = x[1:] * [w, h, w, h]  # box
-                        b[2:] = b[2:].max()  # rectangle to square
-                        b[2:] = b[2:] * 1.3 + 30  # pad
-                        b = xywh2xyxy(b.reshape(-1, 4)).ravel().astype(np.int)
+                        if self.rotated:
+                        ### I guess the labels are: [class, x, y, width, height, yaw] from below
+                            b = x[1:]
+                            b[:4] = b[:4] * [w, h, w, h]  # box
+                            b[2:4] = b[2:4].max()  # rectangle to square
+                            b[2:4] = b[2:4] * 1.3 + 30  # pad
+                            b = xywh2xyxy_r(b.reshape(-1, 5), external_aa=True).ravel().astype(np.int)
+                        else:
+                        ### I guess the labels are: [class, x, y, width, height] from below
+                            b = x[1:] * [w, h, w, h]  # box
+                            b[2:] = b[2:].max()  # rectangle to square
+                            b[2:] = b[2:] * 1.3 + 30  # pad
+                            b = xywh2xyxy(b.reshape(-1, 4)).ravel().astype(np.int)
+                            ### b only has one dim, so reshape is fine, otherwise should use transpose?
 
                         b[[0, 2]] = np.clip(b[[0, 2]], 0, w)  # clip boxes outside of image
                         b[[1, 3]] = np.clip(b[[1, 3]], 0, h)
@@ -451,21 +482,39 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             labels = []
             x = self.labels[index]
             if x.size > 0:
-                # Normalized xywh to pixel xyxy format
-                labels = x.copy()
-                labels[:, 1] = ratio[0] * w * (x[:, 1] - x[:, 3] / 2) + pad[0]  # pad width
-                labels[:, 2] = ratio[1] * h * (x[:, 2] - x[:, 4] / 2) + pad[1]  # pad height
-                labels[:, 3] = ratio[0] * w * (x[:, 1] + x[:, 3] / 2) + pad[0]
-                labels[:, 4] = ratio[1] * h * (x[:, 2] + x[:, 4] / 2) + pad[1]
+                if not self.rotated:
+                    # Normalized xywh to pixel xyxy format
+                    ### w, h reflect the resizing of the original image to one with max size no more than self.img_size (see load_image())
+                    ### ratio reflects the distortion caused by aligning image size to 32x, (see letterbox())
+                    ### we should avoid the case when ratio[0] != ratio[1], in which case the rotated bbox is not preserved ()
+                    labels = x.copy()
+                    labels[:, 1] = ratio[0] * w * (x[:, 1] - x[:, 3] / 2) + pad[0]  # pad width
+                    labels[:, 2] = ratio[1] * h * (x[:, 2] - x[:, 4] / 2) + pad[1]  # pad height
+                    labels[:, 3] = ratio[0] * w * (x[:, 1] + x[:, 3] / 2) + pad[0]
+                    labels[:, 4] = ratio[1] * h * (x[:, 2] + x[:, 4] / 2) + pad[1]
+                else:
+                    # Normalized xywhr to pixel xywhr format
+                    labels = x.copy()
+                    labels[:, 1] = ratio[0] * w * x[:, 1] + pad[0]  # pad width
+                    labels[:, 2] = ratio[1] * h * x[:, 2] + pad[1]  # pad height
+                    labels[:, 3] = ratio[0] * w * x[:, 3]
+                    labels[:, 4] = ratio[1] * h * x[:, 4]
+                    
 
         if self.augment:
             # Augment imagespace
             if not self.mosaic:
-                img, labels = random_affine(img, labels,
-                                            degrees=hyp['degrees'],
-                                            translate=hyp['translate'],
-                                            scale=hyp['scale'],
-                                            shear=hyp['shear'])
+                if not self.rotated:
+                    img, labels = random_affine(img, labels,
+                                                degrees=hyp['degrees'],
+                                                translate=hyp['translate'],
+                                                scale=hyp['scale'],
+                                                shear=hyp['shear'])
+                else:
+                    img, labels = random_affine_xywhr(img, labels,
+                                                degrees=hyp['degrees'],
+                                                translate=hyp['translate'],
+                                                scale=hyp['scale'])
 
             # Augment colorspace
             augment_hsv(img, hgain=hyp['hsv_h'], sgain=hyp['hsv_s'], vgain=hyp['hsv_v'])
@@ -476,8 +525,9 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
 
         nL = len(labels)  # number of labels
         if nL:
-            # convert xyxy to xywh
-            labels[:, 1:5] = xyxy2xywh(labels[:, 1:5])
+            if not self.rotated:
+                # convert xyxy to xywh
+                labels[:, 1:5] = xyxy2xywh(labels[:, 1:5])
 
             # Normalize coordinates 0 - 1
             labels[:, [2, 4]] /= img.shape[0]  # height
@@ -490,7 +540,10 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 img = np.fliplr(img)
                 if nL:
                     labels[:, 1] = 1 - labels[:, 1]
+                    if self.rotated:
+                        labels[:, 5] = - labels[:, 5]
 
+            ### TODO: rotated flag is not implemented here, since ud_flip is not used
             # random up-down flip
             ud_flip = False
             if ud_flip and random.random() < 0.5:
@@ -498,7 +551,10 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 if nL:
                     labels[:, 2] = 1 - labels[:, 2]
 
-        labels_out = torch.zeros((nL, 6))
+        if self.rotated:
+            labels_out = torch.zeros((nL, 7))
+        else:
+            labels_out = torch.zeros((nL, 6))
         if nL:
             labels_out[:, 1:] = torch.from_numpy(labels)
 
@@ -554,6 +610,7 @@ def augment_hsv(img, hgain=0.5, sgain=0.5, vgain=0.5):
 
 def load_mosaic(self, index):
     # loads images in a mosaic
+    ### TODO: rotated flag is not implemented here
 
     labels4 = []
     s = self.img_size
@@ -642,6 +699,65 @@ def letterbox(img, new_shape=(416, 416), color=(114, 114, 114), auto=True, scale
     img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)  # add border
     return img, ratio, (dw, dh)
 
+
+def random_affine_xywhr(img, targets=(), degrees=10, translate=.1, scale=.1, border=0):
+    ### to adapt to rotated bbox, we do not accept shear augmentation here. 
+    ### different from random_affine() which takes xyxy as target input, 
+    ### here we take xywhr as input (but denormalized to pixel) because we want to preserve the rectangle property
+
+    height = img.shape[0] + border * 2
+    width = img.shape[1] + border * 2
+
+    # Rotation and Scale
+    R = np.eye(3)
+    a = random.uniform(-degrees, degrees)
+    # a += random.choice([-180, -90, 0, 90])  # add 90deg rotations to small rotations
+    s = random.uniform(1 - scale, 1 + scale)
+    # s = 2 ** random.uniform(-scale, scale)
+    R[:2] = cv2.getRotationMatrix2D(angle=a, center=(img.shape[1] / 2, img.shape[0] / 2), scale=s)
+    ### angle – Rotation angle in degrees. Positive values mean counter-clockwise rotation (the coordinate origin is assumed to be the top-left corner). [[c,s], [-s,c]]
+    ### https://docs.opencv.org/2.4/modules/imgproc/doc/geometric_transformations.html#getrotationmatrix2d
+
+    # Translation
+    T = np.eye(3)
+    T[0, 2] = random.uniform(-translate, translate) * img.shape[0] + border  # x translation (pixels)
+    T[1, 2] = random.uniform(-translate, translate) * img.shape[1] + border  # y translation (pixels)
+
+    # Combined rotation matrix
+    M = T @ R  # ORDER IS IMPORTANT HERE!!
+    if (border != 0) or (M != np.eye(3)).any():  # image changed
+        img = cv2.warpAffine(img, M[:2], dsize=(width, height), flags=cv2.INTER_LINEAR, borderValue=(114, 114, 114))
+
+    # Transform label coordinates
+    n = len(targets)
+    if n:
+        x0y0 = np.ones((n, 3))
+        x0y0[:, :2] = targets[:, [1,2]]
+        x0y0_new = (x0y0 @ M.T)[:, :2]
+
+        wh = targets[:, [3,4]]
+        wh_new = wh * s
+
+        if targets.shape[1] == 6:
+            yaw = targets[:, [5]]
+            yaw_new = yaw + a*np.pi/180
+
+            xywh_r = np.concatenate((x0y0_new, wh_new, yaw_new), axis=1)
+        else:
+            xywh_r = np.concatenate((x0y0_new, wh_new), axis=1)
+
+        x0 = x0y0_new[:,0]
+        y0 = x0y0_new[:,1]
+        w = wh_new[:,0]
+        h = wh_new[:,1]
+        ar = np.maximum(w / (h + 1e-16), h / (w + 1e-16))  # aspect ratio
+
+        i = (w > 4) & (h > 4) & (x0 > 0) & (x0 < width-1) & (y0 > 0) & (y0 < height-1) & (ar < 10)
+
+        targets = targets[i]
+        targets[:, 1:] = xywh_r[i]
+
+    return img, targets
 
 def random_affine(img, targets=(), degrees=10, translate=.1, scale=.1, shear=10, border=0):
     # torchvision.transforms.RandomAffine(degrees=(-10, 10), translate=(.1, .1), scale=(.9, 1.1), shear=(-10, 10))

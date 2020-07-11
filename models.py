@@ -2,10 +2,11 @@ from utils.google_utils import *
 from utils.layers import *
 from utils.parse_config import *
 
+from utils.utils import yaw2v, v2yaw
 ONNX_EXPORT = False
 
 
-def create_modules(module_defs, img_size, cfg):
+def create_modules(module_defs, img_size, cfg, rotated=False, half_angle=False):
     # Constructs module list of layer blocks from module configuration in module_defs
 
     img_size = [img_size] * 2 if isinstance(img_size, int) else img_size  # expand if necessary
@@ -96,12 +97,16 @@ def create_modules(module_defs, img_size, cfg):
             if any(x in cfg for x in ['panet', 'yolov4', 'cd53']):  # stride order reversed
                 stride = list(reversed(stride))
             layers = mdef['from'] if 'from' in mdef else []
+            # final_odim = mdef['filters'] if 'filters' in mdef else 5    # add rotation option as 'filters' in cfg file
+            # rotated = final_odim == 7
             modules = YOLOLayer(anchors=mdef['anchors'][mdef['mask']],  # anchor list
                                 nc=mdef['classes'],  # number of classes
                                 img_size=img_size,  # (416, 416)
                                 yolo_index=yolo_index,  # 0, 1, 2...
                                 layers=layers,  # output layers
-                                stride=stride[yolo_index])
+                                stride=stride[yolo_index], 
+                                rotated=rotated, 
+                                half_angle=half_angle) ### check rotated flag
 
             # Initialize preceding Conv2d() bias (https://arxiv.org/pdf/1708.02002.pdf section 3.3)
             try:
@@ -128,7 +133,7 @@ def create_modules(module_defs, img_size, cfg):
 
 
 class YOLOLayer(nn.Module):
-    def __init__(self, anchors, nc, img_size, yolo_index, layers, stride):
+    def __init__(self, anchors, nc, img_size, yolo_index, layers, stride, rotated, half_angle):
         super(YOLOLayer, self).__init__()
         self.anchors = torch.Tensor(anchors)
         self.index = yolo_index  # index of this layer in layers
@@ -137,10 +142,26 @@ class YOLOLayer(nn.Module):
         self.nl = len(layers)  # number of output layers (3)
         self.na = len(anchors)  # number of anchors (3)
         self.nc = nc  # number of classes (80)
-        self.no = nc + 5  # number of outputs (85)
-        self.nx, self.ny, self.ng = 0, 0, 0  # initialize number of x, y gridpoints
+        self.rotated = rotated
+        self.half_angle = half_angle
         self.anchor_vec = self.anchors / self.stride
-        self.anchor_wh = self.anchor_vec.view(1, self.na, 1, 1, 2)
+        if self.rotated:
+            assert self.anchor_vec.shape[1] == 3
+            self.anchor_vec[:, 2] = self.anchors[:, 2]
+            self.anchor_wh = self.anchor_vec.view(1, self.na, 1, 1, 3)
+            self.rotated_anchor = True
+        else:
+            assert self.anchor_vec.shape[1] == 2
+            self.anchor_wh = self.anchor_vec.view(1, self.na, 1, 1, 2)
+            self.rotated_anchor = False
+        if self.rotated:
+            if self.rotated_anchor:
+                self.no = nc + 6 # original 5, 1 added to express residual rotation angle w.r.t. anchor. xywhrp
+            else:
+                self.no = nc + 7 # original 5, 2 added to express rotation angle. The 5 are xywhvvp
+        else:
+            self.no = nc + 5 # number of outputs (85)
+        self.nx, self.ny, self.ng = 0, 0, 0  # initialize number of x, y gridpoints
 
         if ONNX_EXPORT:
             self.training = False
@@ -188,6 +209,7 @@ class YOLOLayer(nn.Module):
                 self.create_grids((nx, ny), p.device)
 
         # p.view(bs, 255, 13, 13) -- > (bs, 3, 13, 13, 85)  # (bs, anchors, grid, grid, classes + xywh)
+        # p.view(bs, 261, 13, 13) -- > (bs, 3, 13, 13, 87)  # (bs, anchors, grid, grid, classes + xywh + eigvec) for rotated bbox prediction
         p = p.view(bs, self.na, self.no, self.ny, self.nx).permute(0, 1, 3, 4, 2).contiguous()  # prediction
 
         if self.training:
@@ -198,32 +220,95 @@ class YOLOLayer(nn.Module):
             m = self.na * self.nx * self.ny
             ng = 1. / self.ng.repeat(m, 1)
             grid = self.grid.repeat(1, self.na, 1, 1, 1).view(m, 2)
-            anchor_wh = self.anchor_wh.repeat(1, 1, self.nx, self.ny, 1).view(m, 2) * ng
+            if self.rotated_anchor:
+                anchor_wh = self.anchor_wh.repeat(1, 1, self.nx, self.ny, 1).view(m, 3) * ng
+                anchor_wh[:, -1] = anchor_wh[:, -1] / ng
+            else:
+                anchor_wh = self.anchor_wh.repeat(1, 1, self.nx, self.ny, 1).view(m, 2) * ng
 
             p = p.view(m, self.no)
             xy = torch.sigmoid(p[:, 0:2]) + grid  # x, y
-            wh = torch.exp(p[:, 2:4]) * anchor_wh  # width, height
-            p_cls = torch.sigmoid(p[:, 4:5]) if self.nc == 1 else \
-                torch.sigmoid(p[:, 5:self.no]) * torch.sigmoid(p[:, 4:5])  # conf
-            return p_cls, xy * ng, wh
+            wh = torch.exp(p[:, 2:4]) * anchor_wh[:, :2]  # width, height
+            if not self.rotated:
+                p_cls = torch.sigmoid(p[:, 4:5]) if self.nc == 1 else \
+                    torch.sigmoid(p[:, 5:self.no]) * torch.sigmoid(p[:, 4:5])  # conf
+                return p_cls, xy * ng, wh
+            else:
+                if not self.rotated_anchor:
+                    v_normalized = nn.functional.normalize(p[:, 4:6])
+                    # if self.half_angle:
+                    #     v_normalized[v_normalized[:,0] < 0] *= -1
+                    # yaw = torch.atan2(v_normalized[:,0], v_normalized[:,1]) 
+                    yaw = v2yaw(v_normalized)
+                    ### when yaw=0, vec=[0,1], positive dir is [sin(theta), cos(theta)], counter clockwise, consistent with rotation in augmentation in random_affine_xywhr() in datasets.py.
+
+                    p_cls = torch.sigmoid(p[:, 6:7]) if self.nc == 1 else \
+                        torch.sigmoid(p[:, 7:self.no]) * torch.sigmoid(p[:, 6:7])  # conf
+                else:
+                    if self.half_angle:
+                        yaw = (torch.sigmoid(p[:, 4])-0.5) * math.pi + anchor_wh[:, 2]
+                    else:
+                        yaw = (torch.sigmoid(p[:, 4])-0.5) * math.pi * 1.5 + anchor_wh[:, 2]
+
+                    p_cls = torch.sigmoid(p[:, 5:6]) if self.nc == 1 else \
+                        torch.sigmoid(p[:, 6:self.no]) * torch.sigmoid(p[:, 5:6])  # conf
+
+                return p_cls, xy * ng, wh, yaw
 
         else:  # inference
             io = p.clone()  # inference output
             io[..., :2] = torch.sigmoid(io[..., :2]) + self.grid  # xy
-            io[..., 2:4] = torch.exp(io[..., 2:4]) * self.anchor_wh  # wh yolo method
+            io[..., 2:4] = torch.exp(io[..., 2:4]) * self.anchor_wh[..., :2]  # wh yolo method
             io[..., :4] *= self.stride
-            torch.sigmoid_(io[..., 4:])
-            return io.view(bs, -1, self.no), p  # view [1, 3, 13, 13, 85] as [1, 507, 85]
+            if self.rotated:
+                if not self.rotated_anchor:
+                    io[..., 4:6] = nn.functional.normalize(io[..., 4:6], dim=-1)
+                    # if self.half_angle:
+                    #     need_flip_idx = io[..., 4] < 0
+                    #     io_need_flip = io[need_flip_idx]
+                    #     io_need_flip[:, 4:6] *= -1
+                    #     io[need_flip_idx] = io_need_flip
+                    torch.sigmoid_(io[..., 6:])
+                else:
+                    if self.half_angle:
+                        io[..., 4] = (torch.sigmoid(io[..., 4])-0.5) * math.pi + self.anchor_wh[..., 2]
+                    else:
+                        io[..., 4] = (torch.sigmoid(io[..., 4])-0.5) * math.pi * 1.5 + self.anchor_wh[..., 2]
+                    torch.sigmoid_(io[..., 5:])
+            else:
+                torch.sigmoid_(io[..., 4:])
+            
+            # print("io.shape", io.shape)
+            # vnorm = io[..., 4:6].norm(dim=-1)
+            # print(vnorm.min())
+            # print(vnorm.max())
+            # ### this is in terms of layers
+            # print("io[%d][:,4].min()"%self.index, io[...,4].min())
+            # print("io[%d][:,4].max()"%self.index, io[...,4].max())
+            # print("io[%d][:,5].min()"%self.index, io[...,5].min())
+            # print("io[%d][:,5].max()"%self.index, io[...,5].max())
+            io_return = io.view(bs, -1, self.no)
+            # print("io_return.shape", io_return.shape)
+            # vnorm = io_return[..., 4:6].norm(dim=-1)
+            # print(vnorm.min())
+            # print(vnorm.max())
+            ### this is in terms of layers
+            # print("io_return[%d].min()"%self.index, io_return.min(dim=-2))
+            # print("io_return[%d].max()"%self.index, io_return.max(dim=-2))
+            # print("io_return[%d][:,5].min()"%self.index, io_return[...,5].min())
+            # print("io_return[%d][:,5].max()"%self.index, io_return[...,5].max())
+            # print("io_return.shape", io_return.shape)
+            return io_return, p  # view [1, 3, 13, 13, 85] as [1, 507, 85] (or 85->87 in rotated mode)
 
 
 class Darknet(nn.Module):
     # YOLOv3 object detection model
 
-    def __init__(self, cfg, img_size=(416, 416), verbose=False):
+    def __init__(self, cfg, img_size=(416, 416), verbose=False, rotated=False, half_angle=False):
         super(Darknet, self).__init__()
 
         self.module_defs = parse_model_cfg(cfg)
-        self.module_list, self.routs = create_modules(self.module_defs, img_size, cfg)
+        self.module_list, self.routs = create_modules(self.module_defs, img_size, cfg, rotated=rotated, half_angle=half_angle)
         self.yolo_layers = get_yolo_layers(self)
         # torch_utils.initialize_weights(self)
 
@@ -231,6 +316,10 @@ class Darknet(nn.Module):
         self.version = np.array([0, 2, 5], dtype=np.int32)  # (int32) version info: major, minor, revision
         self.seen = np.array([0], dtype=np.int64)  # (int64) number of images seen during training
         self.info(verbose) if not ONNX_EXPORT else None  # print model description
+
+        self.rotated = rotated
+        self.half_angle = half_angle
+        ### setting rotated only affects when using augmentation in inference. 
 
     def forward(self, x, augment=False, verbose=False):
 
@@ -248,7 +337,11 @@ class Darknet(nn.Module):
                 y.append(self.forward_once(xi)[0])
 
             y[1][..., :4] /= s[0]  # scale
-            y[1][..., 0] = img_size[1] - y[1][..., 0]  # flip lr
+            y[1][..., 0] = img_size[1] - y[1][..., 0]  # flip lr    
+            ### whether to flip lr corresponds to dataset.py LoadImagesAndLabels.__get_item__() if self.augment:
+            if self.rotated:
+            # if y[1].shape[-1] == 87: ### check rotated flag
+                y[1][..., 4] = - y[1][..., 4]
             y[2][..., :4] /= s[1]  # scale
 
             # for i, yi in enumerate(y):  # coco small, medium, large = < 32**2 < 96**2 <
@@ -300,15 +393,32 @@ class Darknet(nn.Module):
             return yolo_out
         elif ONNX_EXPORT:  # export
             x = [torch.cat(x, 0) for x in zip(*yolo_out)]
-            return x[0], torch.cat(x[1:3], 1)  # scores, boxes: 3780x80, 3780x4
+            return x[0], torch.cat(x[1:], 1)  # scores, boxes: 3780x80, 3780x4 (if rotated, 3780*5 with last dim yaw)
+            # return x[0], torch.cat(x[1:3], 1)  # scores, boxes: 3780x80, 3780x4
         else:  # inference or test
             x, p = zip(*yolo_out)  # inference output, training output
+            # print("type(x)", type(x))
+            # print("len(x)", len(x))
             x = torch.cat(x, 1)  # cat yolo outputs
+            ### this is in terms of batch
+            # for ix in range(x.shape[0]):
+                # print("x[%d].shape"%ix, x[ix].shape)
+                # vnorm = x[ix][:, 4:6].norm(dim=-1)
+                # print(vnorm.min())
+                # print(vnorm.max())
+                # print("x[%d,:,4].min()"%ix, x[ix][:,4].min())
+                # print("x[%d,:,4].max()"%ix, x[ix][:,4].max())
+                # print("x[%d,:,5].min()"%ix, x[ix][:,5].min())
+                # print("x[%d,:,5].max()"%ix, x[ix][:,5].max())
             if augment:  # de-augment results
                 x = torch.split(x, nb, dim=0)
                 x[1][..., :4] /= s[0]  # scale
                 x[1][..., 0] = img_size[1] - x[1][..., 0]  # flip lr
+                if self.rotated:
+                # if x[1].shape[-1] == 87: ### check rotated flag
+                    x[1][..., 4] = - x[1][..., 4] # flip lr for the eigen-vector embedding the direction of the box
                 x[2][..., :4] /= s[1]  # scale
+
                 x = torch.cat(x, 1)
             return x, p
 
