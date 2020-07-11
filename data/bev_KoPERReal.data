@@ -1,0 +1,4 @@
+classes=1
+train=/media/sda1/datasets/extracted/KoPER_BEV/Sequence1a/KAB_SK_1_undist/test.txt
+valid=/media/sda1/datasets/extracted/KoPER_BEV/Sequence1a/KAB_SK_1_undist/test.txt
+names=data/bev_network.names

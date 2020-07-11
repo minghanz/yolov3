@@ -1,0 +1,4 @@
+classes=1
+train=data/bev_mixed_train.txt
+valid=data/bev_mixed_test.txt
+names=data/bev_network.names

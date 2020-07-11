@@ -1,0 +1,4 @@
+classes=1
+train=/media/sda1/datasets/extracted/shapenet_lturn_3D_black/bev_like_coco/train.txt
+valid=/media/sda1/datasets/extracted/shapenet_lturn_3D_black/bev_like_coco/test.txt
+names=data/bev_network.names

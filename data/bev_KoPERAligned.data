@@ -1,0 +1,4 @@
+classes=1
+train=data/bev_KoPERAligned_train.txt
+valid=data/bev_KoPERAligned_test.txt
+names=data/bev_network.names
