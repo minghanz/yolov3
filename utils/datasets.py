@@ -257,7 +257,7 @@ class LoadStreams:  # multiple IP or RTSP cameras
 
 class LoadImagesAndLabels(Dataset):  # for training/testing
     def __init__(self, path, img_size=416, batch_size=16, augment=False, hyp=None, rect=False, image_weights=False,
-                 cache_images=False, single_cls=False, rotated=False, half_angle=False):
+                 cache_images=False, single_cls=False, rotated=False, half_angle=False, bev_dataset=False):
         try:
             path = str(Path(path))  # os-agnostic
             if os.path.isfile(path):  # file
@@ -266,6 +266,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             elif os.path.isdir(path):  # folder
                 f = glob.iglob(path + os.sep + '*.*')
             self.img_files = [x.replace('/', os.sep) for x in f if os.path.splitext(x)[-1].lower() in img_formats]
+            self.img_files = sorted(self.img_files)
         except:
             raise Exception('Error loading data from %s. See %s' % (path, help_url))
 
@@ -287,7 +288,11 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         ### for rotated bbox training, turn on rect to disable mosaic training!!!, set the long side using img_size, and short side will be padded to min 32x
 
         # Define labels
-        self.label_files = [x.replace('images', 'labels').replace(os.path.splitext(x)[-1], '.txt')
+        if bev_dataset:
+            self.label_files = [x.replace('images', 'labels').replace('bev', 'rbox_coco').replace(os.path.splitext(x)[-1], '.txt')
+                            for x in self.img_files]
+        else:
+            self.label_files = [x.replace('images', 'labels').replace(os.path.splitext(x)[-1], '.txt')
                             for x in self.img_files]
 
         # Rectangular Training  https://github.com/ultralytics/yolov3/issues/232
@@ -306,10 +311,12 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             s = np.array(s, dtype=np.float64)
             ar = s[:, 1] / s[:, 0]  # aspect ratio
             i = ar.argsort()
+            ### when the aspect ratio is identical for all images, this may produce unexpected sorting result
             self.img_files = [self.img_files[i] for i in i]
             self.label_files = [self.label_files[i] for i in i]
             self.shapes = s[i]  # wh
             ar = ar[i]
+            # self.shapes = s
 
             # Set training image shapes
             shapes = [[1, 1]] * nb
@@ -361,6 +368,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                     assert (l[:, 1:5] <= 1).all(), 'non-normalized or out of bounds coordinate labels: %s' % file
                     if l.shape[1] == 5:
                         l = np.concatenate((l, np.zeros((l.shape[0], 1))), axis=1) ## add a virtual yaw dim
+                    l[:,1:3] = l[:,1:3].clip(1e-5) ### values very close to zero may cause numeric issue (7e-17 for example)
                 else:
                     assert l.shape[1] in [5, 6], '%d label columns while 5 are required: %s' % (l.shape[1], file)
                     assert (l[:, :5] >= 0).all(), 'negative labels: %s' % file

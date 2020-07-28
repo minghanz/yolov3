@@ -1,0 +1,4 @@
+classes=1
+train=/media/sda1/datasets/extracted/roadmanship_format/kitti/object/splits/train.txt
+valid=/media/sda1/datasets/extracted/roadmanship_format/kitti/object/splits/val.txt
+names=data/bev_network.names

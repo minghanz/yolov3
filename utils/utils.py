@@ -127,11 +127,15 @@ def yaw2v(x):
     return y
 
 def yaw2mat(x):
+
+    x = x.reshape(-1,1)
     try:
         if isinstance(x, torch.Tensor):
-            y = torch.stack([torch.tensor([[torch.cos(x[i]), torch.sin(x[i]) ], [-torch.sin(x[i]), torch.cos(x[i])]]) for i in range(x.shape[0])], dim=0).to(device=x.device) # n*2*2
+            # y = torch.stack([torch.tensor([[torch.cos(x[i]), torch.sin(x[i]) ], [-torch.sin(x[i]), torch.cos(x[i])]]) for i in range(x.shape[0])], dim=0).to(device=x.device) # n*2*2
+            y = torch.cat([torch.cos(x), torch.sin(x), -torch.sin(x), torch.cos(x)], dim=1).reshape(-1,2,2)
         else:
-            y = np.stack([np.array([[np.cos(x[i]), np.sin(x[i]) ], [-np.sin(x[i]), np.cos(x[i])]]) for i in range(x.shape[0])], axis=0) # n*2*2
+            # y = np.stack([np.array([[np.cos(x[i]), np.sin(x[i]) ], [-np.sin(x[i]), np.cos(x[i])]]) for i in range(x.shape[0])], axis=0) # n*2*2
+            y = np.concatenate([np.cos(x), np.sin(x), -np.sin(x), np.cos(x)], axis=1).reshape(-1,2,2)
     except:
         print("yaw2mat x", x)
         raise ValueError("empty x?")

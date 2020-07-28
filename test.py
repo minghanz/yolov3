@@ -73,7 +73,7 @@ def test(cfg,
 
     # Dataloader
     if dataloader is None:
-        dataset = LoadImagesAndLabels(path, imgsz, batch_size, rect=True, single_cls=opt.single_cls, rotated=rotated, half_angle=half_angle)
+        dataset = LoadImagesAndLabels(path, imgsz, batch_size, rect=True, single_cls=opt.single_cls, rotated=rotated, half_angle=half_angle, bev_dataset=opt.bev_dataset)
         batch_size = min(batch_size, len(dataset))
         dataloader = DataLoader(dataset,
                                 batch_size=batch_size,
@@ -332,6 +332,7 @@ if __name__ == '__main__':
     parser.add_argument('--rotated', action='store_true', help='use rotated bbox instead of axis-aligned ones')
     parser.add_argument('--rotated-anchor', action='store_true', help='use residual yaw w.r.t. anchors instead of regressing the original angle')
     parser.add_argument('--save-txt', action='store_true', help='save evaluation quantitative results to *.txt')
+    parser.add_argument('--bev-dataset', action='store_true', help='use dataset of customized unified structure for bev')
     opt = parser.parse_args()
     opt.save_json = opt.save_json or any([x in opt.data for x in ['coco.data', 'coco2014.data', 'coco2017.data']])
     opt.cfg = list(glob.iglob('./**/' + opt.cfg, recursive=True))[0]  # find file
