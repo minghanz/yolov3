@@ -42,10 +42,16 @@ hyp = {'giou': 3.54,  # giou loss gain
        'scale': 0.05 * 0,  # image scale (+/- gain)
        'shear': 0.641 * 0}  # image shear (+/- deg)
 
+## for traffic cam
 hyp.update({
     'xy': 4.062, 
     'wh': 0.1845,
     'r': 4.062 })#4.062
+# ### for kitti
+# hyp.update({
+#     'xy': 4.062, 
+#     'wh': 1.845,
+#     'r': 0.4 })#4.062
     # {'giou': 1.008,  # giou loss gain
     #    'xy': 4.062,  # xy loss gain
     #    'wh': 0.1845,  # wh loss gain
@@ -204,7 +210,8 @@ def train(hyp):
                                   cache_images=opt.cache_images,
                                   single_cls=opt.single_cls, 
                                   rotated=rotated, 
-                                  half_angle=half_angle)
+                                  half_angle=half_angle, 
+                                  bev_dataset=opt.bev_dataset)
 
     # Dataloader
     batch_size = min(batch_size, len(dataset))
@@ -223,7 +230,8 @@ def train(hyp):
                                                                  cache_images=opt.cache_images,
                                                                  single_cls=opt.single_cls, 
                                                                  rotated=rotated, 
-                                                                 half_angle=half_angle), 
+                                                                 half_angle=half_angle, 
+                                                                 bev_dataset=opt.bev_dataset), 
                                              batch_size=batch_size,
                                              num_workers=nw,
                                              pin_memory=True,
@@ -308,6 +316,9 @@ def train(hyp):
             imgs = imgs.to(device).float() / 255.0  # uint8 to float32, 0 - 255 to 0.0 - 1.0
             targets = targets.to(device)
 
+            # with open("log_path.txt", "w") as f_tmp:
+            #     for path_item in paths:
+            #         f_tmp.write(path_item+"\n")
             # Burn-in
             if ni <= n_burn:
                 xi = [0, n_burn]  # x interp
@@ -478,6 +489,7 @@ if __name__ == '__main__':
     parser.add_argument('--rotated', action='store_true', help='use rotated bbox instead of axis-aligned ones')
     parser.add_argument('--rotated-anchor', action='store_true', help='use residual yaw w.r.t. anchors instead of regressing the original angle')
     parser.add_argument('--half-angle', action='store_true', help='use 180 degree instead of 360 degree in direction estimation (forward-backward equivalent)')
+    parser.add_argument('--bev-dataset', action='store_true', help='use dataset of customized unified structure for bev')
     
     opt = parser.parse_args()
     opt.weights = last if opt.resume else opt.weights
