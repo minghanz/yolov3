@@ -254,18 +254,28 @@ class LoadStreams:  # multiple IP or RTSP cameras
     def __len__(self):
         return 0  # 1E12 frames = 32 streams at 30 FPS for 30 years
 
+def extract_from_a_path(path):
+    path = str(Path(path))  # os-agnostic
+    if os.path.isfile(path):  # file
+        with open(path, 'r') as f:
+            f = f.read().splitlines()
+    elif os.path.isdir(path):  # folder
+        f = glob.iglob(path + os.sep + '*.*')
+    img_files = [x.replace('/', os.sep) for x in f if os.path.splitext(x)[-1].lower() in img_formats]
+
+    return img_files
 
 class LoadImagesAndLabels(Dataset):  # for training/testing
     def __init__(self, path, img_size=416, batch_size=16, augment=False, hyp=None, rect=False, image_weights=False,
                  cache_images=False, single_cls=False, rotated=False, half_angle=False, bev_dataset=False):
         try:
-            path = str(Path(path))  # os-agnostic
-            if os.path.isfile(path):  # file
-                with open(path, 'r') as f:
-                    f = f.read().splitlines()
-            elif os.path.isdir(path):  # folder
-                f = glob.iglob(path + os.sep + '*.*')
-            self.img_files = [x.replace('/', os.sep) for x in f if os.path.splitext(x)[-1].lower() in img_formats]
+            if isinstance(path, list):
+                self.img_files = []
+                for path_i in path:
+                    img_files = extract_from_a_path(path_i)
+                    self.img_files.extend(img_files)
+            else:
+                self.img_files = extract_from_a_path(path)
             self.img_files = sorted(self.img_files)
         except:
             raise Exception('Error loading data from %s. See %s' % (path, help_url))
@@ -296,9 +306,15 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                             for x in self.img_files]
 
         # Rectangular Training  https://github.com/ultralytics/yolov3/issues/232
+        ### Minghan: this section enables training using images of different sizes. 
+        # All images are sorted according to aspect ratio, so that images in the same batch should have similar aspect ratio. 
+        # Then each mini-batch is assigned with a common batch-shape, such that all shaped in this batch can be fit into it. 
         if self.rect:
             # Read image shapes (wh)
-            sp = path.replace('.txt', '.shapes')  # shapefile path
+            if isinstance(path, list):
+                sp = path[0].replace('.txt', '.shapes')  # shapefile path
+            else:
+                sp = path.replace('.txt', '.shapes')  # shapefile path
             try:
                 with open(sp, 'r') as f:  # read existing shapefile
                     s = [x.split() for x in f.read().splitlines()]

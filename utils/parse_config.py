@@ -70,6 +70,9 @@ def parse_data_cfg(path):
         if line == '' or line.startswith('#'):
             continue
         key, val = line.split('=')
-        options[key.strip()] = val.strip()
+        val = val.strip()
+        options[key.strip()] = val
+        if " " in val:
+            options[key.strip()] = [x for x in val.split(" ")]  ### enable the item to be a list
 
     return options
