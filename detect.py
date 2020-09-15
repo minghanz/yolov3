@@ -14,6 +14,7 @@ def detect(save_img=False):
     rotated = opt.rotated
     rotated_anchor = opt.rotated_anchor
     single_cls = opt.single_cls
+    half_angle = opt.half_angle
 
     # Initialize
     device = torch_utils.select_device(device='cpu' if ONNX_EXPORT else opt.device)
@@ -22,7 +23,7 @@ def detect(save_img=False):
     os.makedirs(out)  # make new output folder
 
     # Initialize model
-    model = Darknet(opt.cfg, imgsz, rotated=rotated)
+    model = Darknet(opt.cfg, imgsz, rotated=rotated, half_angle=half_angle)
 
     # Load weights
     attempt_download(weights)
@@ -156,7 +157,8 @@ def detect(save_img=False):
 
                     if save_img or view_img:  # Add bbox to image
                         if not rotated:
-                            label = '%s %.2f' % (names[int(name_indices[int(cls)])], conf)
+                            # label = '%s %.2f' % (names[int(name_indices[int(cls)])], conf)
+                            label = None
                             plot_one_box(xyxy, im0, label=label, color=colors[int(name_indices[int(cls)])])
                         else:
                             if not single_cls:
@@ -165,6 +167,7 @@ def detect(save_img=False):
                                 label = '%s %.1f' % (cls_name, conf)
                             else:
                                 label = '%.1f' % conf
+                            # label = None
                             plot_one_box(xyxy_8, im0, label=label, color=colors[int(cls)])
 
             # Print time (inference + NMS)
@@ -222,6 +225,7 @@ if __name__ == '__main__':
     parser.add_argument('--single-cls', action='store_true', help='train as single-class dataset')
     parser.add_argument('--rotated', action='store_true', help='use rotated bbox instead of axis-aligned ones')
     parser.add_argument('--rotated-anchor', action='store_true', help='use residual yaw w.r.t. anchors instead of regressing the original angle')
+    parser.add_argument('--half-angle', action='store_true', help='use 180 degree instead of 360 degree in direction estimation (forward-backward equivalent)')
     opt = parser.parse_args()
     opt.cfg = list(glob.iglob('./**/' + opt.cfg, recursive=True))[0]  # find file
     opt.names = list(glob.iglob('./**/' + opt.names, recursive=True))[0]  # find file

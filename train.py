@@ -9,6 +9,9 @@ import test  # import test.py to get mAP after each epoch
 from models import *
 from utils.datasets import *
 from utils.utils import *
+from utils.sampler import BatchFrozenSampler
+
+import torchsnooper
 
 mixed_precision = True
 try:  # Mixed precision training https://github.com/NVIDIA/apex
@@ -76,7 +79,7 @@ if f:
 if hyp['fl_gamma']:
     print('Using FocalLoss(gamma=%g)' % hyp['fl_gamma'])
 
-
+# @torchsnooper.snoop()
 def train(hyp):
     torch.cuda.empty_cache()        # in case previously run application is exited abnormally without clearing the cache in GPU memory
     cfg = opt.cfg
@@ -105,7 +108,11 @@ def train(hyp):
 
     # Configure run
     init_seeds()
-    data_dict = parse_data_cfg(data)
+    if data.endswith("yaml"):
+        assert opt.bev_dataset, "yaml data config file can be used only when the dataset is in bev_dataset format"
+        data_dict = parse_data_yaml(data)
+    else:        
+        data_dict = parse_data_cfg(data)
     train_path = data_dict['train']
     test_path = data_dict['valid']
     nc = 1 if opt.single_cls else int(data_dict['classes'])  # number of classes
@@ -203,7 +210,7 @@ def train(hyp):
         model.yolo_layers = model.module.yolo_layers  # move yolo layer indices to top level
 
     # Dataset
-    dataset = LoadImagesAndLabels(train_path, img_size, batch_size,
+    dataset = LoadImagesAndLabels(train_path, opt.data.rsplit(".", 1)[0]+"_train", img_size, batch_size,
                                   augment=True,
                                   hyp=hyp,  # augmentation hyperparameters
                                   rect=opt.rect,  # rectangular training
@@ -213,18 +220,27 @@ def train(hyp):
                                   half_angle=half_angle, 
                                   bev_dataset=opt.bev_dataset)
 
+    ### batch sampler
+    sampler = BatchFrozenSampler(len(dataset), batch_size, True)
     # Dataloader
     batch_size = min(batch_size, len(dataset))
     nw = min([os.cpu_count(), batch_size if batch_size > 1 else 0, 8])  # number of workers
+    ### original one, which does not shuffle when using opt.rect (which we use)
+    # dataloader = torch.utils.data.DataLoader(dataset,
+    #                                          batch_size=batch_size,
+    #                                          num_workers=nw,
+    #                                          shuffle=not opt.rect,  # Shuffle=True unless rectangular training is used
+    #                                          pin_memory=True,
+    #                                          collate_fn=dataset.collate_fn)
+    ### shuffle using the BatchFrozenSampler
     dataloader = torch.utils.data.DataLoader(dataset,
-                                             batch_size=batch_size,
+                                             batch_sampler=sampler, 
                                              num_workers=nw,
-                                             shuffle=not opt.rect,  # Shuffle=True unless rectangular training is used
                                              pin_memory=True,
                                              collate_fn=dataset.collate_fn)
 
     # Testloader
-    testloader = torch.utils.data.DataLoader(LoadImagesAndLabels(test_path, imgsz_test, batch_size,
+    testloader = torch.utils.data.DataLoader(LoadImagesAndLabels(test_path, opt.data.rsplit(".", 1)[0]+"_valid", imgsz_test, batch_size,
                                                                  hyp=hyp,
                                                                  rect=True,
                                                                  cache_images=opt.cache_images,
@@ -250,7 +266,7 @@ def train(hyp):
     nb = len(dataloader)  # number of batches
     n_burn = max(3 * nb, 500)  # burn-in iterations, max(3 epochs, 500 iterations)
     maps = np.zeros(nc)  # mAP per class
-    # torch.autograd.set_detect_anomaly(True)
+    torch.autograd.set_detect_anomaly(True)         ### Minghan 08202020 debugging the nan in backprop: remember to set it to False after debug!!!!!!!!!
     results = (0, 0, 0, 0, 0, 0, 0)  # 'P', 'R', 'mAP', 'F1', 'val GIoU', 'val Objectness', 'val Classification'
     t0 = time.time()
     print('Image sizes %g - %g train, %g test' % (imgsz_min, imgsz_max, imgsz_test))
@@ -404,7 +420,8 @@ def train(hyp):
                                       iou_thres=0.2,
                                       id=epoch, 
                                       rotated_anchor=rotated_anchor, 
-                                      half_angle=half_angle )
+                                      half_angle=half_angle, 
+                                      bev_dataset=opt.bev_dataset )
 
         # Write
         ### s is from training, as an updated average of the whole epoch

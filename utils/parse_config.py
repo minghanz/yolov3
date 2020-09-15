@@ -1,7 +1,7 @@
 import os
 
 import numpy as np
-
+import yaml
 
 def parse_model_cfg(path):
     # Parse the yolo *.cfg file and return module definitions path may be 'cfg/yolov3.cfg', 'yolov3.cfg', or 'yolov3'
@@ -74,5 +74,27 @@ def parse_data_cfg(path):
         options[key.strip()] = val
         if " " in val:
             options[key.strip()] = [x for x in val.split(" ")]  ### enable the item to be a list
+
+    return options
+
+"""for dataset in our defined format, accept yaml config file, which specifies a combination of train/test set in a cleaner way"""
+def parse_data_yaml(path):
+
+    with open(path) as f:
+        options_raw = yaml.load(f, Loader=yaml.FullLoader)
+    options = dict()
+    for key, value in options_raw.items():
+        if key not in ["train", "valid"]:
+            options[key] = value
+    options["train"] = []
+    options["valid"] = []
+
+    for key, value in options_raw["train"].items():
+        path_cur = os.path.join(options["root"], key, "splits", value+".txt")
+        options["train"].append(path_cur)
+
+    for key, value in options_raw["valid"].items():
+        path_cur = os.path.join(options["root"], key, "splits", value+".txt")
+        options["valid"].append(path_cur)
 
     return options

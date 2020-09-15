@@ -3,6 +3,9 @@ from utils.layers import *
 from utils.parse_config import *
 
 from utils.utils import yaw2v, v2yaw
+
+import torchsnooper
+
 ONNX_EXPORT = False
 
 
@@ -180,6 +183,7 @@ class YOLOLayer(nn.Module):
             self.anchor_vec = self.anchor_vec.to(device)
             self.anchor_wh = self.anchor_wh.to(device)
 
+    # @torchsnooper.snoop()
     def forward(self, p, out):
         ASFF = False  # https://arxiv.org/abs/1911.09516
         if ASFF:
@@ -228,7 +232,10 @@ class YOLOLayer(nn.Module):
 
             p = p.view(m, self.no)
             xy = torch.sigmoid(p[:, 0:2]) + grid  # x, y
-            wh = torch.exp(p[:, 2:4]) * anchor_wh[:, :2]  # width, height
+            # wh = torch.exp(p[:, 2:4]) * anchor_wh[:, :2]  # width, height
+            ### Minghan: trying to fix the nan in grad
+            wh = torch.nn.functional.softplus(p[:, 2:4]) * anchor_wh[:, :2]  # width, height
+            
             if not self.rotated:
                 p_cls = torch.sigmoid(p[:, 4:5]) if self.nc == 1 else \
                     torch.sigmoid(p[:, 5:self.no]) * torch.sigmoid(p[:, 4:5])  # conf
@@ -246,9 +253,9 @@ class YOLOLayer(nn.Module):
                         torch.sigmoid(p[:, 7:self.no]) * torch.sigmoid(p[:, 6:7])  # conf
                 else:
                     if self.half_angle:
-                        yaw = (torch.sigmoid(p[:, 4])-0.5) * math.pi + anchor_wh[:, 2]
+                        yaw = (torch.sigmoid(p[:, 4])-0.5) * math.pi * 0.5 + anchor_wh[:, 2]
                     else:
-                        yaw = (torch.sigmoid(p[:, 4])-0.5) * math.pi * 1.5 + anchor_wh[:, 2]
+                        yaw = (torch.sigmoid(p[:, 4])-0.5) * math.pi + anchor_wh[:, 2]
 
                     p_cls = torch.sigmoid(p[:, 5:6]) if self.nc == 1 else \
                         torch.sigmoid(p[:, 6:self.no]) * torch.sigmoid(p[:, 5:6])  # conf
@@ -258,7 +265,9 @@ class YOLOLayer(nn.Module):
         else:  # inference
             io = p.clone()  # inference output
             io[..., :2] = torch.sigmoid(io[..., :2]) + self.grid  # xy
-            io[..., 2:4] = torch.exp(io[..., 2:4]) * self.anchor_wh[..., :2]  # wh yolo method
+            # io[..., 2:4] = torch.exp(io[..., 2:4]) * self.anchor_wh[..., :2]  # wh yolo method
+            ### Minghan: trying to fix the nan in grad
+            io[..., 2:4] = torch.nn.functional.softplus(io[..., 2:4]) * self.anchor_wh[..., :2]  # wh yolo method
             io[..., :4] *= self.stride
             if self.rotated:
                 if not self.rotated_anchor:
@@ -271,9 +280,9 @@ class YOLOLayer(nn.Module):
                     torch.sigmoid_(io[..., 6:])
                 else:
                     if self.half_angle:
-                        io[..., 4] = (torch.sigmoid(io[..., 4])-0.5) * math.pi + self.anchor_wh[..., 2]
+                        io[..., 4] = (torch.sigmoid(io[..., 4])-0.5) * math.pi * 0.5 + self.anchor_wh[..., 2]
                     else:
-                        io[..., 4] = (torch.sigmoid(io[..., 4])-0.5) * math.pi * 1.5 + self.anchor_wh[..., 2]
+                        io[..., 4] = (torch.sigmoid(io[..., 4])-0.5) * math.pi + self.anchor_wh[..., 2]
                     torch.sigmoid_(io[..., 5:])
             else:
                 torch.sigmoid_(io[..., 4:])
@@ -355,6 +364,7 @@ class Darknet(nn.Module):
             y = torch.cat(y, 1)
             return y, None
 
+    # @torchsnooper.snoop()
     def forward_once(self, x, augment=False, verbose=False):
         img_size = x.shape[-2:]  # height, width
         yolo_out, out = [], []

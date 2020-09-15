@@ -261,12 +261,14 @@ def extract_from_a_path(path):
             f = f.read().splitlines()
     elif os.path.isdir(path):  # folder
         f = glob.iglob(path + os.sep + '*.*')
+    else:
+        assert os.path.exists(path), "the path {} does not exist".format(path)
     img_files = [x.replace('/', os.sep) for x in f if os.path.splitext(x)[-1].lower() in img_formats]
 
     return img_files
 
 class LoadImagesAndLabels(Dataset):  # for training/testing
-    def __init__(self, path, img_size=416, batch_size=16, augment=False, hyp=None, rect=False, image_weights=False,
+    def __init__(self, path, path_cache, img_size=416, batch_size=16, augment=False, hyp=None, rect=False, image_weights=False,
                  cache_images=False, single_cls=False, rotated=False, half_angle=False, bev_dataset=False):
         try:
             if isinstance(path, list):
@@ -311,14 +313,16 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         # Then each mini-batch is assigned with a common batch-shape, such that all shaped in this batch can be fit into it. 
         if self.rect:
             # Read image shapes (wh)
-            if isinstance(path, list):
-                sp = path[0].replace('.txt', '.shapes')  # shapefile path
-            else:
-                sp = path.replace('.txt', '.shapes')  # shapefile path
+            # if isinstance(path, list):
+            #     sp = path[0].replace('.txt', '.shapes')  # shapefile path
+            # else:
+            #     sp = path.replace('.txt', '.shapes')  # shapefile path
+            sp = path_cache+'.shapes'
             try:
                 with open(sp, 'r') as f:  # read existing shapefile
+                    print("reading existing shapefile at:", os.path.abspath(sp))
                     s = [x.split() for x in f.read().splitlines()]
-                    assert len(s) == n, 'Shapefile out of sync'
+                    assert len(s) == n, 'Shapefile out of sync, {} {}'.format(len(s), n))
             except:
                 s = [exif_size(Image.open(f)) for f in tqdm(self.img_files, desc='Reading image shapes')]
                 np.savetxt(sp, s, fmt='%g')  # overwrites existing (if any)
@@ -355,15 +359,23 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             self.labels = [np.zeros((0, 5), dtype=np.float32)] * n
         create_datasubset, extract_bounding_boxes, labels_loaded = False, False, False
         nm, nf, ne, ns, nd = 0, 0, 0, 0, 0  # number missing, found, empty, datasubset, duplicate
-        np_labels_path = str(Path(self.label_files[0]).parent) + '.npy'  # saved labels in *.npy file
+        # np_labels_path = str(Path(self.label_files[0]).parent) + '.npy'  # saved labels in *.npy file
+        np_labels_path = path_cache + '.npy'
         if os.path.isfile(np_labels_path):
+            print("Existing: np_labels_path", np_labels_path)
             s = np_labels_path
             x = list(np.load(np_labels_path, allow_pickle=True))
             if len(x) == n:
                 self.labels = x
                 labels_loaded = True
         else:
-            s = path.replace('images', 'labels')
+            # if isinstance(path, list):
+            #     s = path[0].replace('images', 'labels')
+            # else:
+            #     s = path.replace('images', 'labels')
+            # print("path", path)
+            s = np_labels_path
+            print("Non-existing: np_labels_path", np_labels_path)
 
         pbar = tqdm(self.label_files)
         for i, file in enumerate(pbar):

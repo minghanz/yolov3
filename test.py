@@ -25,7 +25,8 @@ def test(cfg,
          rotated_anchor=False, 
          half_angle=False,
          id=0, 
-         output_path=None):
+         output_path=None, 
+         bev_dataset=False):
     ### opt is accessible only when called in this script itself, where opt is declared outside of functions, therefore a global variable
     ### you are also able to change members in opt, since opt is a mutable object. You cannot modify an immutable object as a global variable in a function, except you declare it as global first in the function. 
     ### https://stackoverflow.com/questions/31435603/python-modify-global-list-inside-a-function
@@ -40,7 +41,7 @@ def test(cfg,
             os.remove(f)
 
         # Initialize model
-        model = Darknet(cfg, imgsz, rotated=rotated)
+        model = Darknet(cfg, imgsz, rotated=rotated, half_angle=half_angle)
 
         # Load weights
         attempt_download(weights)
@@ -60,10 +61,14 @@ def test(cfg,
         verbose = False
 
     # Configure run
-    data = parse_data_cfg(data)
-    nc = 1 if single_cls else int(data['classes'])  # number of classes
-    path = data['valid']  # path to test images
-    names = load_classes(data['names'])  # class names
+    if data.endswith("yaml"):
+        assert bev_dataset, "yaml data config file can be used only when the dataset is in bev_dataset format"
+        data_dict = parse_data_yaml(data)
+    else:        
+        data_dict = parse_data_cfg(data)
+    nc = 1 if single_cls else int(data_dict['classes'])  # number of classes
+    path = data_dict['valid']  # path to test images
+    names = load_classes(data_dict['names'])  # class names
     iouv = torch.linspace(0.5, 0.95, 10).to(device)  # iou vector for mAP@0.5:0.95
     # iouv = torch.linspace(0.2, 0.95, 10).to(device)  # iou vector for mAP@0.5:0.95
     iouv = iouv[0].view(1)  # comment for mAP@0.5:0.95
@@ -73,7 +78,7 @@ def test(cfg,
 
     # Dataloader
     if dataloader is None:
-        dataset = LoadImagesAndLabels(path, imgsz, batch_size, rect=True, single_cls=opt.single_cls, rotated=rotated, half_angle=half_angle, bev_dataset=opt.bev_dataset)
+        dataset = LoadImagesAndLabels(path, data.rsplit(".", 1)[0]+"_valid", imgsz, batch_size, rect=True, single_cls=single_cls, rotated=rotated, half_angle=half_angle, bev_dataset=bev_dataset)
         batch_size = min(batch_size, len(dataset))
         dataloader = DataLoader(dataset,
                                 batch_size=batch_size,
@@ -331,6 +336,7 @@ if __name__ == '__main__':
     parser.add_argument('--augment', action='store_true', help='augmented inference')
     parser.add_argument('--rotated', action='store_true', help='use rotated bbox instead of axis-aligned ones')
     parser.add_argument('--rotated-anchor', action='store_true', help='use residual yaw w.r.t. anchors instead of regressing the original angle')
+    parser.add_argument('--half-angle', action='store_true', help='use 180 degree instead of 360 degree in direction estimation (forward-backward equivalent)')
     parser.add_argument('--save-txt', action='store_true', help='save evaluation quantitative results to *.txt')
     parser.add_argument('--bev-dataset', action='store_true', help='use dataset of customized unified structure for bev')
     opt = parser.parse_args()
@@ -363,7 +369,9 @@ if __name__ == '__main__':
              opt.augment, 
              rotated=opt.rotated, 
              rotated_anchor=opt.rotated_anchor, 
-             output_path=output_path)
+             output_path=output_path, 
+             half_angle=opt.half_angle, 
+             bev_dataset=opt.bev_dataset)
 
     elif opt.task == 'benchmark':  # mAPs at 256-640 at conf 0.5 and 0.7
         y = []

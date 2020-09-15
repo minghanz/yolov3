@@ -24,6 +24,8 @@ import torch
 # from d3d.box import box2d_iou, box2d_nms, box2d_crop
 import d3d
 
+import torchsnooper
+
 # import sys
 # sys.path.append("../../")
 # from bev.rbox_torch import *
@@ -101,6 +103,11 @@ def coco80_to_coco91_class():  # converts 80-index (val2014) to 91-index (paper)
 def xyxy2xywh(x):
     # Convert nx4 boxes from [x1, y1, x2, y2] to [x, y, w, h] where xy1=top-left, xy2=bottom-right
     y = torch.zeros_like(x) if isinstance(x, torch.Tensor) else np.zeros_like(x)
+
+    if len(x) == 0:
+        print("empty input in xyxy2xywh")
+        return y
+
     y[:, 0] = (x[:, 0] + x[:, 2]) / 2  # x center
     y[:, 1] = (x[:, 1] + x[:, 3]) / 2  # y center
     y[:, 2] = x[:, 2] - x[:, 0]  # width
@@ -111,6 +118,11 @@ def xyxy2xywh(x):
 def xywh2xyxy(x):
     # Convert nx4 boxes from [x, y, w, h] to [x1, y1, x2, y2] where xy1=top-left, xy2=bottom-right
     y = torch.zeros_like(x) if isinstance(x, torch.Tensor) else np.zeros_like(x)
+
+    if len(x) == 0:
+        print("empty input in xywh2xyxy")
+        return y
+
     y[:, 0] = x[:, 0] - x[:, 2] / 2  # top left x
     y[:, 1] = x[:, 1] - x[:, 3] / 2  # top left y
     y[:, 2] = x[:, 0] + x[:, 2] / 2  # bottom right x
@@ -148,6 +160,10 @@ def xywh2xyxy_r(x, external_aa=False):
         y = torch.zeros((x.shape[0], 4), dtype=x.dtype, device=x.device) if isinstance(x, torch.Tensor) else np.zeros((x.shape[0], 4), dtype=x.dtype)
     else:
         y = torch.zeros((x.shape[0], 8), dtype=x.dtype, device=x.device) if isinstance(x, torch.Tensor) else np.zeros((x.shape[0], 8), dtype=x.dtype)
+
+    if len(x) == 0:
+        print("empty input in xywh2xyxy_r")
+        return y
 
     # xyxy_ur = xywh2xyxy(x[:,:4])
     y[:, 0] = - x[:, 2] / 2  # top left x
@@ -469,7 +485,7 @@ def smooth_BCE(eps=0.1):  # https://github.com/ultralytics/yolov3/issues/238#iss
     # return positive, negative label smoothing BCE targets
     return 1.0 - 0.5 * eps, 0.5 * eps
 
-
+# @torchsnooper.snoop()
 def compute_loss(p, targets, model, use_giou_loss=False, half_angle=False):  # predictions, targets, model
     ### input p here is training output
 
@@ -517,7 +533,8 @@ def compute_loss(p, targets, model, use_giou_loss=False, half_angle=False):  # p
             # print("anchors", anchors[i].shape)
             # print("pswh", ps[:, 2:4].shape)
             pxy = ps[:, :2].sigmoid()
-            pwh = ps[:, 2:4].exp().clamp(max=1E3) * anchors[i][:,:2]
+            # pwh = ps[:, 2:4].exp().clamp(max=1E3) * anchors[i][:,:2]    ### Minghan: trying to fix the nan in grad
+            pwh = torch.nn.functional.softplus(ps[:, 2:4]) * anchors[i][:,:2]
             if not rotated:
                 pbox = torch.cat((pxy, pwh), 1)  # predicted box
                 giou = bbox_iou(pbox.t(), tbox[i], x1y1x2y2=False, GIoU=True)  # giou(prediction, target)
@@ -529,9 +546,9 @@ def compute_loss(p, targets, model, use_giou_loss=False, half_angle=False):  # p
                     ### when calculating iou, rotation difference of 180 does not matter.
                 else:
                     if half_angle:
-                        pyaw_local = (torch.sigmoid(ps[:, 4])-0.5) * math.pi
+                        pyaw_local = (torch.sigmoid(ps[:, 4])-0.5) * math.pi * 0.5
                     else:
-                        pyaw_local = (torch.sigmoid(ps[:, 4])-0.5) * math.pi * 1.5
+                        pyaw_local = (torch.sigmoid(ps[:, 4])-0.5) * math.pi # * 1.5 # using range larger than [-0.5pi, 0.5pi] could result in dead lock
                     pyaw = pyaw_local + anchors[i][:,2]
 
                 pbox = torch.cat((pxy, pwh, -pyaw.unsqueeze(1)), 1)  # predicted box
@@ -574,8 +591,8 @@ def compute_loss(p, targets, model, use_giou_loss=False, half_angle=False):  # p
                             lr += MSE(prvec, trvec)  # wh yolo loss
                     else:
                         if half_angle:
-                            lr += MSE(pyaw_local, tyaw[i])
-                            # lr += torch.sin((pyaw_local - tyaw[i])/2).pow(2).sum() if red == 'sum' else torch.sin((pyaw_local - tyaw[i])/2).pow(2).mean()  # giou loss
+                            # lr += MSE(pyaw_local, tyaw[i])
+                            lr += torch.sin(pyaw_local - tyaw[i]).pow(2).sum() if red == 'sum' else torch.sin(pyaw_local - tyaw[i]).pow(2).mean()  # giou loss
                         else:
                             # lr += torch.sin((pyaw_local - tyaw[i])/2).abs().sum() if red == 'sum' else torch.sin((pyaw_local - tyaw[i])/2).abs().mean()  # giou loss
                             lr += torch.sin((pyaw_local - tyaw[i])/2).pow(2).sum() if red == 'sum' else torch.sin((pyaw_local - tyaw[i])/2).pow(2).mean()  # giou loss
@@ -680,11 +697,13 @@ def build_targets(p, targets, model, half_angle):
                 assert anchors.shape[1] == 3
                 assert rotated
                 if half_angle:
-                    whiou = wh_iou(anchors[:, :2], t[:, 4:6]) #> model.hyp['iou_t']  # iou(3,n) = wh_iou(anchors(3,2), gwh(n,2))
-                    j = whiou > model.hyp['iou_t']      ### a bool matrix of na(3)*nt
+                    # whiou = wh_iou(anchors[:, :2], t[:, 4:6]) #> model.hyp['iou_t']  # iou(3,n) = wh_iou(anchors(3,2), gwh(n,2))
+                    # j = whiou > model.hyp['iou_t']      ### a bool matrix of na(3)*nt
+                    riou = r_align(anchors[:, 2], t[:, 6])
+                    j = torch.abs(riou) > 0.71                      ### 08162020: 0.707 -> pi/2
                 else:
                     riou = r_align(anchors[:, 2], t[:, 6])
-                    j = riou > 0
+                    j = riou > 0.1                      ### 08162020: slightly larger than 0 to avoid dead lock
             a, t = at[j], t.repeat(na, 1, 1)[j]  # filter
             ### a is n_filtered index, and t is now n_filtered * 6 or 7 matrix, both are in terms of n*m
 
@@ -731,7 +750,10 @@ def build_targets(p, targets, model, half_angle):
         anch.append(anchors[a])  # anchors
         tcls.append(c)  # class
 
-        twh.append(torch.log(gwh / anchors[a][:, :2]))
+        # twh.append(torch.log(gwh / anchors[a][:, :2]))
+        ### Minghan: trying to fix the nan in grad
+        twh.append( torch.log(torch.exp(gwh / anchors[a][:, :2]) - 1) )
+        
         txy.append(gxy - gij)
 
         if rotated_anchor:
@@ -1515,33 +1537,33 @@ def plot_results(start=0, stop=0, bucket='', id=()):  # from utils.utils import 
     else:
         files = glob.glob('results*.txt') + glob.glob('../../Downloads/results*.txt')
     for f in sorted(files):
-        try:
-            # results = np.loadtxt(f, usecols=[2, 3, 4, 8, 9, 12, 13, 14, 10, 11], ndmin=2).T
-            ### for compatible with rotated mode
-            # results = np.loadtxt(f, usecols=[2, 3, 4, 5, 6, 7, 11, 12, 15, 16, 17, 18, 19, 20, 13, 14], ndmin=2).T
-            results = np.loadtxt(f, usecols=[2, 3, 5, 6, 7, 11, 12, 15, 16, 18, 19, 20, 13, 14], ndmin=2).T
+        # try:
+        # results = np.loadtxt(f, usecols=[2, 3, 4, 8, 9, 12, 13, 14, 10, 11], ndmin=2).T
+        ### for compatible with rotated mode
+        # results = np.loadtxt(f, usecols=[2, 3, 4, 5, 6, 7, 11, 12, 15, 16, 17, 18, 19, 20, 13, 14], ndmin=2).T
+        results = np.loadtxt(f, usecols=[2, 3, 5, 6, 7, 11, 12, 15, 16, 18, 19, 20, 13, 14], ndmin=2, skiprows=1).T
 
-            n = results.shape[1]  # number of rows
-            x = range(start, min(stop, n) if stop else n)
-            # for i in range(10):
+        n = results.shape[1]  # number of rows
+        x = range(start, min(stop, n) if stop else n)
+        # for i in range(10):
+        ### for compatible with rotated mode
+        # for i in range(16):
+        for i in range(14):
+            y = results[i, x]
+            # if i in [0, 1, 2, 5, 6, 7]:
             ### for compatible with rotated mode
-            # for i in range(16):
-            for i in range(14):
-                y = results[i, x]
-                # if i in [0, 1, 2, 5, 6, 7]:
-                ### for compatible with rotated mode
-                # if i in [0, 1, 2, 8, 9, 10]:
-                if i in [0, 1, 8, 9]:
-                    y[y == 0] = np.nan  # dont show zero loss values
-                    # y /= y[0]  # normalize
-                # y[y == 0] = np.nan  # dont show zero loss values
-                ax[i].plot(x, y, marker='.', label=Path(f).stem[8:], linewidth=2, markersize=8)
-                ### [8:] is to remove "results_" substring
-                ax[i].set_title(s[i])
-                # if i in [5, 6, 7]:  # share train and val loss y axes
-                #     ax[i].get_shared_y_axes().join(ax[i], ax[i - 5])
-        except:
-            print('Warning: Plotting error for %s, skipping file' % f)
+            # if i in [0, 1, 2, 8, 9, 10]:
+            if i in [0, 1, 8, 9]:
+                y[y == 0] = np.nan  # dont show zero loss values
+                # y /= y[0]  # normalize
+            # y[y == 0] = np.nan  # dont show zero loss values
+            ax[i].plot(x, y, marker='.', label=Path(f).stem[8:], linewidth=2, markersize=8)
+            ### [8:] is to remove "results_" substring
+            ax[i].set_title(s[i])
+            # if i in [5, 6, 7]:  # share train and val loss y axes
+            #     ax[i].get_shared_y_axes().join(ax[i], ax[i - 5])
+        # except:
+        #     print('Warning: Plotting error for %s, skipping file' % f)
 
     ax[1].legend()
     # fig.savefig('results.png', dpi=200)
