@@ -16,6 +16,9 @@ from tqdm import tqdm
 
 from utils.utils import xyxy2xywh, xywh2xyxy, xywh2xyxy_r
 
+import re
+import bev
+
 help_url = 'https://github.com/ultralytics/yolov3/wiki/Train-Custom-Data'
 img_formats = ['.bmp', '.jpg', '.jpeg', '.png', '.tif', '.dng']
 vid_formats = ['.mov', '.avi', '.mp4', '.mkv']
@@ -41,8 +44,48 @@ def exif_size(img):
     return s
 
 
+class LoadImagesDual(Dataset):
+    def __init__(self, dataset_dual_first, dataset_dual_second):
+        self.dual_first = dataset_dual_first
+        self.dual_second = dataset_dual_second
+
+        
+    def __getattr__(self, name):
+        # here you may have to exclude thigs; i.e. forward them to
+        # self.name instead for self._impl.name
+        # try:
+        #     return getattr(self._impl, name)
+        # except AttributeError:
+        if name == "dual_first":
+            return self.dual_first
+        elif name == "dual_second":
+            return self.dual_second
+        else:
+            # do something else...
+            return getattr(self.dual_first, name)
+
+    def __len__(self):
+        return len(self.dual_first)
+    
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.count == self.nF:
+            raise StopIteration
+        path_bev, img_bev, img0_bev, invalid_mask, cap_bev, H_world_bev = next(self.dual_first)
+        _, img_ori, _, _, _, H_world_img = next(self.dual_second)
+        
+        # bev, labels_out, path, shapes_bev, H_world_bev = self.dual_first[index]
+        # img, _, _, shapes_img, H_world_img = self.dual_second[index]
+        
+        H_img_world = torch.inverse(H_world_img)
+        H_img_bev = torch.matmul(H_img_world, H_world_bev)
+
+        return path_bev, img_bev, img0_bev, invalid_mask, cap_bev, H_img_bev, img_ori
+
 class LoadImages:  # for inference
-    def __init__(self, path, img_size=416):
+    def __init__(self, path, img_size=416, dual_view_first=False, dual_view_second=False, use_mask=False):
         path = str(Path(path))  # os-agnostic
         files = []
         if os.path.isdir(path):
@@ -50,11 +93,18 @@ class LoadImages:  # for inference
         elif os.path.isfile(path):
             files = [path]
 
+        self.dual_view_first = dual_view_first                    # dual_view means this dataset is to load original view images. 
+        self.dual_view_second = dual_view_second                  # dual_view means this dataset is to load original view images. 
+
+        if self.dual_view_second:
+            files = [x.replace("bev", "ori") for x in files]
+
         images = [x for x in files if os.path.splitext(x)[-1].lower() in img_formats]
         videos = [x for x in files if os.path.splitext(x)[-1].lower() in vid_formats]
         nI, nV = len(images), len(videos)
 
         self.img_size = img_size
+        print("self.img_size", self.img_size)
         self.files = images + videos
         self.nF = nI + nV  # number of files
         self.video_flag = [False] * nI + [True] * nV
@@ -65,6 +115,13 @@ class LoadImages:  # for inference
             self.cap = None
         assert self.nF > 0, 'No images or videos found in ' + path
 
+        self.count = 0
+
+        ### invalid_label_region_masks
+        self.use_mask = use_mask
+        self.invalid_label_region_mask = [os.path.join(x.split("images")[0], "masks", "bev_invalid_label_region.png") for x in images] + \
+                            [os.path.join(x.split("videos")[0], "masks", "bev_invalid_label_region.png") for x in videos]
+
     def __iter__(self):
         self.count = 0
         return self
@@ -73,6 +130,12 @@ class LoadImages:  # for inference
         if self.count == self.nF:
             raise StopIteration
         path = self.files[self.count]
+
+        path_invalid_mask = self.invalid_label_region_mask[self.count]
+        invalid_mask = None
+        if self.use_mask:
+            invalid_mask = cv2.imread(path_invalid_mask)
+        
 
         if self.video_flag[self.count]:
             # Read video
@@ -87,26 +150,123 @@ class LoadImages:  # for inference
                     path = self.files[self.count]
                     self.new_video(path)
                     ret_val, img0 = self.cap.read()
+                    
+                    path_invalid_mask = self.invalid_label_region_mask[self.count]
+                    if self.use_mask:
+                        invalid_mask = cv2.imread(path_invalid_mask)
 
             self.frame += 1
-            print('video %g/%g (%g/%g) %s: ' % (self.count + 1, self.nF, self.frame, self.nframes, path), end='')
+            # print('video %g/%g (%g/%g) %s: ' % (self.count + 1, self.nF, self.frame, self.nframes, path), end='')
 
         else:
             # Read image
             self.count += 1
             img0 = cv2.imread(path)  # BGR
             assert img0 is not None, 'Image Not Found ' + path
-            print('image %g/%g %s: ' % (self.count, self.nF, path), end='')
+            # print('image %g/%g %s: ' % (self.count, self.nF, path), end='')
 
         # Padded resize
-        img = letterbox(img0, new_shape=self.img_size)[0]
+        # img = letterbox(img0, new_shape=self.img_size)[0]
+        img, ratio, pad = letterbox(img0, new_shape=self.img_size)
 
         # Convert
         img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB, to 3x416x416
         img = np.ascontiguousarray(img)
 
+        if invalid_mask is not None:
+            invalid_mask, _, _ = letterbox(invalid_mask, new_shape=self.img_size)
+            invalid_mask = invalid_mask[:, :, [0]].transpose(2, 0, 1)  # BGR to RGB, to 3x416x416
+            invalid_mask = np.ascontiguousarray(invalid_mask)
+
+        ### for dual_view, preload all calibs and bspecs
+        if self.dual_view_first or self.dual_view_second:
+            root_path = "/media/sda1/datasets/extracted/roadmanship_format"
+
+            if "CARLA" in path:
+                match = re.search("trial_c\d+_\d+", path)
+                sub_root = path[:match.end()]
+                calib_file = os.path.join(sub_root, 'calibs', 'camera.txt')
+                assert os.path.exists(calib_file), calib_file
+                calib = bev.homo_constr.load_calib("CARLA", calib_file)
+                
+                matched_str = path[match.start(): match.end()]
+                assert len(matched_str) == 10
+                big = int(matched_str[7])
+                small = float(matched_str[9])
+                code = big + 0.1*small
+                bspec = bev.homo_constr.preset_bspec("CARLA", code)
+            elif "shapenet_KoPER" in path:
+                calib_file = path.replace("images", "labels").replace("ori", "blender").replace("bev", "blender").replace(".png", ".txt")  ### "ori" or "bev" should occur in the path
+                assert os.path.exists(calib_file), calib_file
+                calib = bev.homo_constr.load_calib("blender", calib_file)
+
+                code = 1 if "shapenet_KoPER1" in path else 4
+                bspec = bev.homo_constr.preset_bspec("KoPER", code)
+            elif "shapenet_lturn" in path:
+                calib_file = path.replace("images", "labels").replace("ori", "blender").replace("bev", "blender").replace(".png", ".txt")
+                assert os.path.exists(calib_file), calib_file
+                calib = bev.homo_constr.load_calib("blender", calib_file)
+
+                bspec = bev.homo_constr.preset_bspec("lturn")
+            elif "KoPER" in path:
+                code = 1 if "KAB_SK_1_undist" in path else 4
+                calib = bev.homo_constr.preset_calib("KoPER", code)
+                bspec = bev.homo_constr.preset_bspec("KoPER", code)
+            elif "roundabout" in path:
+                calib = bev.homo_constr.preset_calib("roundabout")
+                bspec = bev.homo_constr.preset_bspec("roundabout")
+            elif "lturn" in path:
+                calib = bev.homo_constr.preset_calib("lturn")
+                bspec = bev.homo_constr.preset_bspec("lturn")
+            elif "BrnoCompSpeed" in path:
+                sub_root = path.split("videos")[0]
+                calib_file = os.path.join(sub_root, "calibs", "system_dubska_optimal_calib.json")
+                video_tag = sub_root.split("session")[-1]
+                if video_tag[-1] == "/":
+                    video_tag = video_tag[:-1]
+                tag_num = int(video_tag[0])
+                tag_sub_dict = {"left":0.1, "center":0.2, "right":0.3}
+                tag_num = tag_num + tag_sub_dict[video_tag.split("_")[1]]
+                calib = bev.homo_constr.load_calib("BrnoCompSpeed", calib_file)
+                calib = calib.scale(align_corners=False, new_u=852, new_v=480)
+                bspec = bev.homo_constr.preset_bspec("BrnoCompSpeed", tag_num, calib)
+            else:
+                raise ValueError("file not recognized: {}".format(path))
+
+            if self.dual_view_second:
+                assert calib.u_size == img0.shape[1], "calib.u_size: {}, w0: {}".format(calib.u_size, img0.shape[1])
+                assert calib.v_size == img0.shape[0], "calib.v_size: {}, h0: {}".format(calib.v_size, img0.shape[0])
+                calib = calib.scale(align_corners=False, scale_ratio_u=ratio[0], scale_ratio_v=ratio[1])
+                calib = calib.pad(pad[0], pad[1], pad[0], pad[1])
+            elif self.dual_view_first:
+                assert bspec.u_size == img0.shape[1], "bspec.u_size: {}, w0: {}, img_file: {}".format(bspec.u_size, img0.shape[1], path)
+                assert bspec.v_size == img0.shape[0], "bspec.v_size: {}, h0: {}".format(bspec.v_size, img0.shape[0])
+                bspec = bspec.scale(align_corners=False, scale_ratio_u=ratio[0], scale_ratio_v=ratio[1])
+                bspec = bspec.pad(pad[0], pad[1], pad[0], pad[1])
+
+            if self.dual_view_first:
+                H_world_img = bspec.gen_H_world_bev()
+                bspec_2 = bspec.scale(align_corners=False, scale_ratio_u=1/8, scale_ratio_v=1/8)
+                bspec_4 = bspec_2.scale(align_corners=False, scale_ratio_u=0.5, scale_ratio_v=0.5)
+                H_world_img_2 = bspec_2.gen_H_world_bev()
+                H_world_img_4 = bspec_4.gen_H_world_bev()
+            elif self.dual_view_second:
+                H_world_img = calib.gen_H_world_img()
+                calib_2 = calib.scale(align_corners=False, scale_ratio_u=1/8, scale_ratio_v=1/8)
+                calib_4 = calib_2.scale(align_corners=False, scale_ratio_u=0.5, scale_ratio_v=0.5)
+                H_world_img_2 = calib_2.gen_H_world_img()
+                H_world_img_4 = calib_4.gen_H_world_img()
+            
+            H_world_img = torch.from_numpy(H_world_img)
+            H_world_img_2 = torch.from_numpy(H_world_img_2)
+            H_world_img_4 = torch.from_numpy(H_world_img_4)
+
+            H_stack = torch.stack([H_world_img, H_world_img_2, H_world_img_4], dim=0)
+
+            return path, img, img0, invalid_mask, self.cap, H_stack
+
         # cv2.imwrite(path + '.letterbox.jpg', 255 * img.transpose((1, 2, 0))[:, :, ::-1])  # save letterbox image
-        return path, img, img0, self.cap
+        return path, img, img0, invalid_mask, self.cap
 
     def new_video(self, path):
         self.frame = 0
@@ -267,9 +427,62 @@ def extract_from_a_path(path):
 
     return img_files
 
+class LoadImagesAndLabelsDual(Dataset):
+    def __init__(self, dataset_dual_first, dataset_dual_second):
+        self.dual_first = dataset_dual_first
+        self.dual_second = dataset_dual_second
+
+        
+    def __getattr__(self, name):
+        # here you may have to exclude thigs; i.e. forward them to
+        # self.name instead for self._impl.name
+        # try:
+        #     return getattr(self._impl, name)
+        # except AttributeError:
+        if name == "dual_first":
+            return self.dual_first
+        elif name == "dual_second":
+            return self.dual_second
+        else:
+            # do something else...
+            return getattr(self.dual_first, name)
+
+    def __len__(self):
+        return len(self.dual_first)
+    
+    def __getitem__(self, index):
+        bev, invalid_mask, labels_out, path, shapes_bev, H_world_bev = self.dual_first[index]
+        img, _, _, _, shapes_img, H_world_img = self.dual_second[index]
+
+        H_img_world = torch.inverse(H_world_img)
+        H_img_bev = torch.matmul(H_img_world, H_world_bev)
+
+        if self.dual_first.augment:
+            img, img_np, img_blank = augment_strip_occlusion(img, torch_mode=True)
+
+            H_img_bev_cur_np = H_img_bev[0].numpy() # 3*3
+            H_bev_img_cur_np = np.linalg.inv(H_img_bev_cur_np)
+
+            bev_img = cv2.warpPerspective(img_np, H_bev_img_cur_np, (bev.shape[2],bev.shape[1]))
+            bev_blank = cv2.warpPerspective(img_blank, H_bev_img_cur_np, (bev.shape[2],bev.shape[1]))
+
+            bev, _, _ = augment_strip_occlusion(bev, torch_mode=True, img_blank=bev_blank, img_src=bev_img)            
+
+            bev, dropped_channels = augment_channel_drop(bev, torch_mode=True)
+            img, _ = augment_channel_drop(img, torch_mode=True, dropout_chnl=dropped_channels)
+        
+        return bev, invalid_mask, labels_out, path, shapes_bev, img, shapes_img, H_img_bev
+
+    @staticmethod
+    def collate_fn(batch):
+        bev, invalid_mask, label, path, shapes_bev, img, shapes_img, H_img_bev = zip(*batch)  # transposed
+        for i, l in enumerate(label):
+            l[:, 0] = i  # add target image index for build_targets()
+        return torch.stack(bev, 0), invalid_mask, torch.cat(label, 0), path, shapes_bev, torch.stack(img, 0), shapes_img, torch.stack(H_img_bev, 0)
+
 class LoadImagesAndLabels(Dataset):  # for training/testing
     def __init__(self, path, path_cache, img_size=416, batch_size=16, augment=False, hyp=None, rect=False, image_weights=False,
-                 cache_images=False, single_cls=False, rotated=False, half_angle=False, bev_dataset=False):
+                 cache_images=False, single_cls=False, rotated=False, half_angle=False, bev_dataset=False, tail=False, dual_view_first=False, dual_view_second=False, i_files=None, use_mask=False):
         try:
             if isinstance(path, list):
                 self.img_files = []
@@ -297,15 +510,42 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         self.mosaic = self.augment and not self.rect  # load 4 images at a time into a mosaic (only during training)
         self.rotated = rotated
         self.half_angle = half_angle
+        self.tail = tail
+        self.dual_view_first = dual_view_first                    # dual_view means this dataset is to load original view images. 
+        self.dual_view_second = dual_view_second                  # dual_view means this dataset is to load original view images. 
+        self.use_mask = use_mask
+        
         ### for rotated bbox training, turn on rect to disable mosaic training!!!, set the long side using img_size, and short side will be padded to min 32x
 
         # Define labels
         if bev_dataset:
-            self.label_files = [x.replace('images', 'labels').replace('bev', 'rbox_coco').replace(os.path.splitext(x)[-1], '.txt')
+            if tail:
+                self.label_files = [x.replace('images', 'labels').replace('bev', 'rboxtt_coco').replace(os.path.splitext(x)[-1], '.txt')
+                            for x in self.img_files]
+                if not all(os.path.exists(x) for x in self.label_files):
+                    print("rbox_tt labeling folder does not exist, turning to rbox_coco folder instead, then adding dummy tail labels")
+                    for x in self.label_files:
+                        if not os.path.exists(x):
+                            print("Rboxtt not existing:", x)
+                            break
+                    self.label_files = [x.replace('images', 'labels').replace('bev', 'rbox_coco').replace(os.path.splitext(x)[-1], '.txt')
+                            for x in self.img_files]
+            else:
+                self.label_files = [x.replace('images', 'labels').replace('bev', 'rbox_coco').replace(os.path.splitext(x)[-1], '.txt')
                             for x in self.img_files]
         else:
             self.label_files = [x.replace('images', 'labels').replace(os.path.splitext(x)[-1], '.txt')
                             for x in self.img_files]
+
+        if self.dual_view_second:
+            self.img_files = [x.replace("bev", "ori") for x in self.img_files]
+
+        if self.dual_view_first:
+            print(all("ori" not in imgfile for imgfile in self.img_files))
+            print(self.dual_view_second)
+
+        ### bev mask for valid labels region:   # the path may not exist, in which case the whole image is valid
+        self.invalid_label_region_mask = [os.path.join(x.split("images")[0], "masks", "bev_invalid_label_region.png") for x in self.img_files]
 
         # Rectangular Training  https://github.com/ultralytics/yolov3/issues/232
         ### Minghan: this section enables training using images of different sizes. 
@@ -322,7 +562,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 with open(sp, 'r') as f:  # read existing shapefile
                     print("reading existing shapefile at:", os.path.abspath(sp))
                     s = [x.split() for x in f.read().splitlines()]
-                    assert len(s) == n, 'Shapefile out of sync, {} {}'.format(len(s), n))
+                    assert len(s) == n, 'Shapefile out of sync, {} {}'.format(len(s), n)
             except:
                 s = [exif_size(Image.open(f)) for f in tqdm(self.img_files, desc='Reading image shapes')]
                 np.savetxt(sp, s, fmt='%g')  # overwrites existing (if any)
@@ -331,9 +571,15 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             s = np.array(s, dtype=np.float64)
             ar = s[:, 1] / s[:, 0]  # aspect ratio
             i = ar.argsort()
+            if self.dual_view_second:
+                assert i_files is not None, "dual_view_second mode should use the file sequences generated by dual_view_first. "
+                i = i_files
+            elif self.dual_view_first:
+                self.i_files = i                 ## save the sequence of files for the initialization of the original view dataset (dual_view_second)
             ### when the aspect ratio is identical for all images, this may produce unexpected sorting result
             self.img_files = [self.img_files[i] for i in i]
             self.label_files = [self.label_files[i] for i in i]
+            self.invalid_label_region_mask = [self.invalid_label_region_mask[i] for i in i]
             self.shapes = s[i]  # wh
             ar = ar[i]
             # self.shapes = s
@@ -354,7 +600,10 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         # Cache labels
         self.imgs = [None] * n
         if self.rotated:
-            self.labels = [np.zeros((0, 6), dtype=np.float32)] * n
+            if self.tail:
+                self.labels = [np.zeros((0, 8), dtype=np.float32)] * n
+            else:
+                self.labels = [np.zeros((0, 6), dtype=np.float32)] * n
         else:
             self.labels = [np.zeros((0, 5), dtype=np.float32)] * n
         create_datasubset, extract_bounding_boxes, labels_loaded = False, False, False
@@ -389,14 +638,46 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                     nm += 1  # print('missing labels for image %s' % self.img_files[i])  # file missing
                     continue
 
-            if l.shape[0]:
+            if l.size:
                 if self.rotated:
-                    assert l.shape[1] in [5,6], '%d label columns while 6 are required: %s' % (l.shape[1], file)
-                    assert (l[:,:5] >= 0).all(), 'negative labels: %s' % file
-                    assert (l[:, 1:5] <= 1).all(), 'non-normalized or out of bounds coordinate labels: %s' % file
-                    if l.shape[1] == 5:
-                        l = np.concatenate((l, np.zeros((l.shape[0], 1))), axis=1) ## add a virtual yaw dim
-                    l[:,1:3] = l[:,1:3].clip(1e-5) ### values very close to zero may cause numeric issue (7e-17 for example)
+                    if self.tail:
+                        assert l.shape[1] in [6,8], '%d label columns while 8 are required: %s' % (l.shape[1], file)
+                        assert (l[:,:5] >= 0).all(), 'negative labels: %s' % file
+                        assert (l[:, 1:5] <= 1).all(), 'non-normalized or out of bounds coordinate labels: %s' % file
+                        if l.shape[1] == 6:
+                            # print("tail gt is missing, appending dummy zeros")
+                            l = np.concatenate((l, np.zeros((l.shape[0], 2))), axis=1)
+
+                        # ### old checking: removes labels with too long tail
+                        # if not (np.abs(l[:, [6,7]]) <= 1).all():
+                        #     print('non-normalized or out of bounds coordinate labels: %s' % file)
+                        #     iir = []
+                        #     for ir in range(l.shape[0]):
+                        #         if (np.abs(l[ir, [6,7]]) <= 1).all():
+                        #             iir.append(ir)
+                        #     l = l[iir]
+
+                        ### new checking: 11282020
+                        ### 1. if tail is in the wrong direction (dy should always < 0), go opposite direction. 
+                        if not (l[:, 7] <= 0).all():
+                            print('tail end at region where perspective transform is not defined: %s' % file)
+                            for ir in range(l.shape[0]):
+                                if l[ir, 7] > 0:
+                                    l[ir, 6:8] = - l[ir, 6:8]
+
+                        ### 2. clip tail end to zeros. 
+                        tail_end = l[:, 1:3] + l[:, 6:8]
+                        tail_end = tail_end.clip(0, 1)
+                        l[:, 6:8] = tail_end - l[:, 1:3]
+
+                        l[:,1:3] = l[:,1:3].clip(1e-5) ### values very close to zero may cause numeric issue (7e-17 for example)
+                    else:
+                        assert l.shape[1] in [5,6], '%d label columns while 6 are required: %s' % (l.shape[1], file)
+                        assert (l[:,:5] >= 0).all(), 'negative labels: %s' % file
+                        assert (l[:, 1:5] <= 1).all(), 'non-normalized or out of bounds coordinate labels: %s' % file
+                        if l.shape[1] == 5:
+                            l = np.concatenate((l, np.zeros((l.shape[0], 1))), axis=1) ## add a virtual yaw dim
+                        l[:,1:3] = l[:,1:3].clip(1e-5) ### values very close to zero may cause numeric issue (7e-17 for example)
                 else:
                     assert l.shape[1] in [5, 6], '%d label columns while 5 are required: %s' % (l.shape[1], file)
                     assert (l[:, :5] >= 0).all(), 'negative labels: %s' % file
@@ -404,57 +685,61 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                     if l.shape[1] == 6:
                         l = l[:, :5] ## delete the yaw dim
 
-                if np.unique(l, axis=0).shape[0] < l.shape[0]:  # duplicate rows
-                    nd += 1  # print('WARNING: duplicate rows in %s' % self.label_files[i])  # duplicate rows
-                if single_cls:
-                    l[:, 0] = 0  # force dataset into single-class mode
-                if self.rotated and self.half_angle:    
-                    ### so that the gt angle is between 0 and pi (later there may be augmentation so it could still go out of the range, but it's fine) 
-                    l[l[:, 5]<0, 5] += math.pi
+                if l.shape[0]:
+                    if np.unique(l, axis=0).shape[0] < l.shape[0]:  # duplicate rows
+                        nd += 1  # print('WARNING: duplicate rows in %s' % self.label_files[i])  # duplicate rows
+                    if single_cls:
+                        l[:, 0] = 0  # force dataset into single-class mode
+                    if self.rotated and self.half_angle:    
+                        ### so that the gt angle is between 0 and pi (later there may be augmentation so it could still go out of the range, but it's fine) 
+                        l[l[:, 5]<0, 5] += math.pi
 
-                self.labels[i] = l
-                nf += 1  # file found
+                    self.labels[i] = l
+                    nf += 1  # file found
 
-                # Create subdataset (a smaller dataset)
-                if create_datasubset and ns < 1E4:
-                    if ns == 0:
-                        create_folder(path='./datasubset')
-                        os.makedirs('./datasubset/images')
-                    exclude_classes = 43
-                    if exclude_classes not in l[:, 0]:
-                        ns += 1
-                        # shutil.copy(src=self.img_files[i], dst='./datasubset/images/')  # copy image
-                        with open('./datasubset/images.txt', 'a') as f:
-                            f.write(self.img_files[i] + '\n')
+                    # Create subdataset (a smaller dataset)
+                    if create_datasubset and ns < 1E4:
+                        if ns == 0:
+                            create_folder(path='./datasubset')
+                            os.makedirs('./datasubset/images')
+                        exclude_classes = 43
+                        if exclude_classes not in l[:, 0]:
+                            ns += 1
+                            # shutil.copy(src=self.img_files[i], dst='./datasubset/images/')  # copy image
+                            with open('./datasubset/images.txt', 'a') as f:
+                                f.write(self.img_files[i] + '\n')
 
-                # Extract object detection boxes for a second stage classifier
-                if extract_bounding_boxes:
-                    p = Path(self.img_files[i])
-                    img = cv2.imread(str(p))
-                    h, w = img.shape[:2]
-                    for j, x in enumerate(l):
-                        f = '%s%sclassifier%s%g_%g_%s' % (p.parent.parent, os.sep, os.sep, x[0], j, p.name)
-                        if not os.path.exists(Path(f).parent):
-                            os.makedirs(Path(f).parent)  # make new output folder
+                    # Extract object detection boxes for a second stage classifier
+                    if extract_bounding_boxes:
+                        p = Path(self.img_files[i])
+                        img = cv2.imread(str(p))
+                        h, w = img.shape[:2]
+                        for j, x in enumerate(l):
+                            f = '%s%sclassifier%s%g_%g_%s' % (p.parent.parent, os.sep, os.sep, x[0], j, p.name)
+                            if not os.path.exists(Path(f).parent):
+                                os.makedirs(Path(f).parent)  # make new output folder
 
-                        if self.rotated:
-                        ### I guess the labels are: [class, x, y, width, height, yaw] from below
-                            b = x[1:]
-                            b[:4] = b[:4] * [w, h, w, h]  # box
-                            b[2:4] = b[2:4].max()  # rectangle to square
-                            b[2:4] = b[2:4] * 1.3 + 30  # pad
-                            b = xywh2xyxy_r(b.reshape(-1, 5), external_aa=True).ravel().astype(np.int)
-                        else:
-                        ### I guess the labels are: [class, x, y, width, height] from below
-                            b = x[1:] * [w, h, w, h]  # box
-                            b[2:] = b[2:].max()  # rectangle to square
-                            b[2:] = b[2:] * 1.3 + 30  # pad
-                            b = xywh2xyxy(b.reshape(-1, 4)).ravel().astype(np.int)
-                            ### b only has one dim, so reshape is fine, otherwise should use transpose?
+                            if self.rotated:
+                            ### I guess the labels are: [class, x, y, width, height, yaw] from below
+                                b = x[1:6]
+                                b[:4] = b[:4] * [w, h, w, h]  # box
+                                b[2:4] = b[2:4].max()  # rectangle to square
+                                b[2:4] = b[2:4] * 1.3 + 30  # pad
+                                b = xywh2xyxy_r(b.reshape(-1, 5), external_aa=True).ravel().astype(np.int)
+                            else:
+                            ### I guess the labels are: [class, x, y, width, height] from below
+                                b = x[1:] * [w, h, w, h]  # box
+                                b[2:] = b[2:].max()  # rectangle to square
+                                b[2:] = b[2:] * 1.3 + 30  # pad
+                                b = xywh2xyxy(b.reshape(-1, 4)).ravel().astype(np.int)
+                                ### b only has one dim, so reshape is fine, otherwise should use transpose?
 
-                        b[[0, 2]] = np.clip(b[[0, 2]], 0, w)  # clip boxes outside of image
-                        b[[1, 3]] = np.clip(b[[1, 3]], 0, h)
-                        assert cv2.imwrite(f, img[b[1]:b[3], b[0]:b[2]]), 'Failure extracting classifier boxes'
+                            b[[0, 2]] = np.clip(b[[0, 2]], 0, w)  # clip boxes outside of image
+                            b[[1, 3]] = np.clip(b[[1, 3]], 0, h)
+                            assert cv2.imwrite(f, img[b[1]:b[3], b[0]:b[2]]), 'Failure extracting classifier boxes'
+                else:
+                    ne += 1
+            
             else:
                 ne += 1  # print('empty labels for image %s' % self.img_files[i])  # file empty
                 # os.system("rm '%s' '%s'" % (self.img_files[i], self.label_files[i]))  # remove
@@ -508,11 +793,87 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         else:
             # Load image
             img, (h0, w0), (h, w) = load_image(self, index)
+            if self.dual_view_second:
+                invalid_mask = None
+            else:
+                invalid_mask, hw0_mask, hw_mask = load_image_mask(self, index)
+                if invalid_mask is not None:
+                    h0_mask, w0_mask = hw0_mask
+                    h_mask, w_mask = hw_mask
+                    assert h == h_mask
+                    assert w == w_mask
 
+            # print("-------------")
+            # print("VIS img.shape", img.shape, self.dual_view_first)
             # Letterbox
             shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size  # final letterboxed shape
             img, ratio, pad = letterbox(img, shape, auto=False, scaleup=self.augment)
             shapes = (h0, w0), ((h / h0, w / w0), pad)  # for COCO mAP rescaling
+
+            if invalid_mask is not None:
+                invalid_mask, _, _ = letterbox(invalid_mask, shape, auto=False, scaleup=self.augment)
+
+            # print("VIS img.shape", img.shape, self.dual_view_first)
+            ### load bev spec
+            ### for dual_view, load corresponding bspec and calib
+            ### modify it according to the scaling and padding
+
+            ### for dual_view, preload all calibs and bspecs
+            if self.dual_view_first or self.dual_view_second:
+                root_path = "/media/sda1/datasets/extracted/roadmanship_format"
+
+                if "CARLA" in self.img_files[index]:
+                    match = re.search("trial_c\d+_\d+", self.img_files[index])
+                    sub_root = self.img_files[index][:match.end()]
+                    calib_file = os.path.join(sub_root, 'calibs', 'camera.txt')
+                    assert os.path.exists(calib_file), calib_file
+                    calib_0 = bev.homo_constr.load_calib("CARLA", calib_file)
+                    
+                    matched_str = self.img_files[index][match.start(): match.end()]
+                    assert len(matched_str) == 10
+                    big = int(matched_str[7])
+                    small = float(matched_str[9])
+                    code = big + 0.1*small
+                    bspec_0 = bev.homo_constr.preset_bspec("CARLA", code)
+                elif "shapenet_KoPER" in self.img_files[index]:
+                    calib_file = self.img_files[index].replace("images", "labels").replace("ori", "blender").replace("bev", "blender").replace(".png", ".txt")  ### "ori" or "bev" should occur in the path
+                    assert os.path.exists(calib_file), calib_file
+                    calib_0 = bev.homo_constr.load_calib("blender", calib_file)
+
+                    code = 1 if "shapenet_KoPER1" in self.img_files[index] else 4
+                    bspec_0 = bev.homo_constr.preset_bspec("KoPER", code)
+                elif "shapenet_lturn" in self.img_files[index]:
+                    calib_file = self.img_files[index].replace("images", "labels").replace("ori", "blender").replace("bev", "blender").replace(".png", ".txt")
+                    assert os.path.exists(calib_file), calib_file
+                    calib_0 = bev.homo_constr.load_calib("blender", calib_file)
+
+                    bspec_0 = bev.homo_constr.preset_bspec("lturn", 0)  ## synthetic lturn, use original bspec
+                elif "KoPER" in self.img_files[index]:
+                    code = 1 if "KAB_SK_1_undist" in self.img_files[index] else 4
+                    calib_0 = bev.homo_constr.preset_calib("KoPER", code)
+                    bspec_0 = bev.homo_constr.preset_bspec("KoPER", code)
+                elif "roundabout" in self.img_files[index]:
+                    calib_0 = bev.homo_constr.preset_calib("roundabout")
+                    bspec_0 = bev.homo_constr.preset_bspec("roundabout")
+                elif "lturn" in self.img_files[index]:      ## real lturn, 
+                    calib_0 = bev.homo_constr.preset_calib("lturn")
+                    bspec_0 = bev.homo_constr.preset_bspec("lturn")
+                else:
+                    raise ValueError("file not recognized: {}".format(self.img_files[index]))
+
+                if self.dual_view_second:
+                    assert calib_0.u_size == w0, "calib_0.u_size: {}, w0: {}".format(calib_0.u_size, w0)
+                    assert calib_0.v_size == h0, "calib_0.v_size: {}, h0: {}".format(calib_0.v_size, h0)
+                    calib = calib_0.scale(align_corners=False, new_u=w, new_v=h)
+                    calib = calib.pad(pad[0], pad[1], pad[0], pad[1])
+                elif self.dual_view_first:
+                    assert bspec_0.u_size == w0, "bspec_0.u_size: {}, w0: {}, img_file: {}".format(bspec_0.u_size, w0, self.img_files[index])
+                    assert bspec_0.v_size == h0, "bspec_0.v_size: {}, h0: {}".format(bspec_0.v_size, h0)
+                    bspec = bspec_0.scale(align_corners=False, new_u=w, new_v=h)
+                    bspec = bspec.pad(pad[0], pad[1], pad[0], pad[1])
+
+                # print("VIS h0 w0 h w pad", h0, w0, h, w, pad, self.dual_view_first)
+
 
             # Load labels
             labels = []
@@ -535,25 +896,35 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                     labels[:, 2] = ratio[1] * h * x[:, 2] + pad[1]  # pad height
                     labels[:, 3] = ratio[0] * w * x[:, 3]
                     labels[:, 4] = ratio[1] * h * x[:, 4]
+                    if self.tail:
+                        labels[:, 6] = ratio[0] * w * x[:, 6]
+                        labels[:, 7] = ratio[1] * h * x[:, 7]
                     
 
         if self.augment:
             # Augment imagespace
-            if not self.mosaic:
+            if (not self.mosaic) and (not self.dual_view_first) and (not self.dual_view_second):
                 if not self.rotated:
-                    img, labels = random_affine(img, labels,
+                    img, labels, invalid_mask = random_affine(img, labels,
                                                 degrees=hyp['degrees'],
                                                 translate=hyp['translate'],
                                                 scale=hyp['scale'],
-                                                shear=hyp['shear'])
+                                                shear=hyp['shear'], 
+                                                mask=invalid_mask)
                 else:
-                    img, labels = random_affine_xywhr(img, labels,
+                    img, labels, invalid_mask = random_affine_xywhr(img, labels,
                                                 degrees=hyp['degrees'],
                                                 translate=hyp['translate'],
-                                                scale=hyp['scale'])
+                                                scale=hyp['scale'], 
+                                                mask=invalid_mask)
 
             # Augment colorspace
             augment_hsv(img, hgain=hyp['hsv_h'], sgain=hyp['hsv_s'], vgain=hyp['hsv_v'])
+
+            ### added to adapt to black-white image and color image at the same time
+            if not (self.dual_view_first or self.dual_view_second):
+                ### if dual_view, do this augmentation outside in dual view loader so that the dropped channels are the same for both views. 
+                img, dropped_channels = augment_channel_drop(img, torch_mode=False)
 
             # Apply cutouts
             # if random.random() < 0.9:
@@ -568,27 +939,44 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             # Normalize coordinates 0 - 1
             labels[:, [2, 4]] /= img.shape[0]  # height
             labels[:, [1, 3]] /= img.shape[1]  # width
+            if self.tail:
+                labels[:, 7] /= img.shape[0]  # height
+                labels[:, 6] /= img.shape[1]  # width
 
+        # if self.augment and not (self.dual_view_first or self.dual_view_second):   ### VISMODE1113 disable augment since it is not consistent between first view and second view: (No. It is oay to flip one of ori and bev. )
         if self.augment:
             # random left-right flip
             lr_flip = True
             if lr_flip and random.random() < 0.5:
                 img = np.fliplr(img)
+                if invalid_mask is not None:
+                    invalid_mask = np.fliplr(invalid_mask)
                 if nL:
                     labels[:, 1] = 1 - labels[:, 1]
                     if self.rotated:
                         labels[:, 5] = - labels[:, 5]
+                        if self.tail:
+                            labels[:, 6] = - labels[:, 6]
+                if self.dual_view_first:
+                    bspec = bspec.flip(lr=True)
+                elif self.dual_view_second:
+                    calib = calib.flip(lr=True)
 
             ### TODO: rotated flag is not implemented here, since ud_flip is not used
             # random up-down flip
             ud_flip = False
             if ud_flip and random.random() < 0.5:
                 img = np.flipud(img)
+                if invalid_mask is not None:
+                    invalid_mask = np.flipud(invalid_mask)
                 if nL:
                     labels[:, 2] = 1 - labels[:, 2]
 
         if self.rotated:
-            labels_out = torch.zeros((nL, 7))
+            if self.tail:
+                labels_out = torch.zeros((nL, 9))
+            else:
+                labels_out = torch.zeros((nL, 7))
         else:
             labels_out = torch.zeros((nL, 6))
         if nL:
@@ -597,16 +985,53 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         # Convert
         img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB, to 3x416x416
         img = np.ascontiguousarray(img)
+        if invalid_mask is not None:
+            invalid_mask = invalid_mask[:, :, [0]].transpose(2, 0, 1)  # 1xH*W
+            invalid_mask = np.ascontiguousarray(invalid_mask)
+            invalid_mask = torch.from_numpy(invalid_mask)
 
-        return torch.from_numpy(img), labels_out, self.img_files[index], shapes
+        # print("VIS img.shape", img.shape, self.dual_view_first)
+
+        if self.dual_view_first or self.dual_view_second:
+            if self.dual_view_first:
+                H_world_img = bspec.gen_H_world_bev()
+                bspec_2 = bspec.scale(align_corners=False, scale_ratio_u=1/8, scale_ratio_v=1/8)
+                bspec_4 = bspec_2.scale(align_corners=False, scale_ratio_u=0.5, scale_ratio_v=0.5)
+                H_world_img_2 = bspec_2.gen_H_world_bev()
+                H_world_img_4 = bspec_4.gen_H_world_bev()
+                H_world_img_0 = bspec_0.gen_H_world_bev()
+            elif self.dual_view_second:
+                H_world_img = calib.gen_H_world_img()
+                calib_2 = calib.scale(align_corners=False, scale_ratio_u=1/8, scale_ratio_v=1/8)
+                calib_4 = calib_2.scale(align_corners=False, scale_ratio_u=0.5, scale_ratio_v=0.5)
+                H_world_img_2 = calib_2.gen_H_world_img()
+                H_world_img_4 = calib_4.gen_H_world_img()
+                H_world_img_0 = calib_0.gen_H_world_img()
+            
+            H_world_img = torch.from_numpy(H_world_img)
+            H_world_img_2 = torch.from_numpy(H_world_img_2)
+            H_world_img_4 = torch.from_numpy(H_world_img_4)
+            H_world_img_0 = torch.from_numpy(H_world_img_0)
+
+            H_stack = torch.stack([H_world_img, H_world_img_2, H_world_img_4, H_world_img_0], dim=0)
+            
+            return torch.from_numpy(img), invalid_mask, labels_out, self.img_files[index], shapes, H_stack
+
+        return torch.from_numpy(img), invalid_mask, labels_out, self.img_files[index], shapes
 
     @staticmethod
     def collate_fn(batch):
-        img, label, path, shapes = zip(*batch)  # transposed
+        img, invalid_mask, label, path, shapes = zip(*batch)  # transposed
         for i, l in enumerate(label):
             l[:, 0] = i  # add target image index for build_targets()
-        return torch.stack(img, 0), torch.cat(label, 0), path, shapes
+        return torch.stack(img, 0), invalid_mask, torch.cat(label, 0), path, shapes
 
+    @staticmethod
+    def collate_fn_dual(batch):
+        img, label, path, shapes, H_stacks = zip(*batch)  # transposed
+        for i, l in enumerate(label):
+            l[:, 0] = i  # add target image index for build_targets()
+        return torch.stack(img, 0), invalid_mask, torch.cat(label, 0), path, shapes, torch.stack(H_stacks, 0)
 
 def load_image(self, index):
     # loads 1 image from dataset, returns img, original hw, resized hw
@@ -624,6 +1049,19 @@ def load_image(self, index):
     else:
         return self.imgs[index], self.img_hw0[index], self.img_hw[index]  # img, hw_original, hw_resized
 
+def load_image_mask(self, index):
+    # loads 1 image from dataset, returns img, original hw, resized hw
+    path = self.invalid_label_region_mask[index]
+    img = cv2.imread(path)  # BGR
+    if img is None or not self.use_mask:
+        return None, None, None
+    else:
+        h0, w0 = img.shape[:2]  # orig hw
+        r = self.img_size / max(h0, w0)  # resize image to img_size
+        if r < 1 or (self.augment and r != 1):  # always resize down, only resize up if training with augmentation
+            interp = cv2.INTER_AREA if r < 1 and not self.augment else cv2.INTER_LINEAR
+            img = cv2.resize(img, (int(w0 * r), int(h0 * r)), interpolation=interp)
+        return img, (h0, w0), img.shape[:2]  # img, hw_original, hw_resized
 
 def augment_hsv(img, hgain=0.5, sgain=0.5, vgain=0.5):
     r = np.random.uniform(-1, 1, 3) * [hgain, sgain, vgain] + 1  # random gains
@@ -643,6 +1081,72 @@ def augment_hsv(img, hgain=0.5, sgain=0.5, vgain=0.5):
     #     for i in range(3):
     #         img[:, :, i] = cv2.equalizeHist(img[:, :, i])
 
+def augment_strip_occlusion(img, torch_mode, img_blank=None, img_src=None):
+    if torch_mode:
+        C, H, W = img.shape
+        img_np = np.ascontiguousarray(img.numpy().transpose(1,2,0))     ### must explicitly call ascontiguousarray, otherwise opencv does not work. 
+    else:
+        H, W, C = img.shape 
+        img_np = img
+
+    if img_blank is None:
+        left = random.randrange(0, H)
+        right = random.randrange(0, H)
+        width = random.randint(5, 12)
+        cv2.line(img_np, (0, left), (W-1, right), (0, 0, 0), width)
+
+        img_blank = np.zeros_like(img_np)
+        # img_blank = np.zeros(img_np.shape, np.uint8)
+        gray_1 = random.randint(0, 255)
+        gray_2 = random.randint(0, 255)
+        gray_3 = random.randint(0, 255)
+        black = random.randint(0, 9)
+        if black == 0:
+            gray_1 = 0
+            gray_2 = 0
+            gray_3 = 0
+        cv2.line(img_blank, (0, left), (W-1, right), (gray_1, gray_2, gray_3), width)
+    else:
+        img_np[img_blank>0] = img_src[img_blank>0]
+
+    if torch_mode:
+        img = torch.from_numpy(img_np).permute(2, 0, 1)
+    else:
+        img = img_np
+
+    return img, img_np, img_blank
+
+def augment_channel_drop(img, torch_mode, dropout_chnl=None):
+
+    if dropout_chnl is None:
+        dropout_chnl = []
+        if random.random() < 0.5:
+            dropout_chnl.append(0)
+        if random.random() < 0.5:
+            dropout_chnl.append(1)
+        if random.random() < 0.5:
+            dropout_chnl.append(2)
+
+        if len(dropout_chnl) == 3:
+            dropout_chnl = []
+
+    assert isinstance(dropout_chnl, list)
+
+    if torch_mode:
+        img = img.float()
+        for chnl in dropout_chnl:
+            img[chnl] = 0
+    else:
+        img = img.astype(np.float32)
+        for chnl in dropout_chnl:
+            img[..., chnl] = 0
+
+    # n_left_chnl = 3 - len(dropout_chnl)
+    # img = img / n_left_chnl * 3
+
+    return img, dropout_chnl
+
+    
 
 def load_mosaic(self, index):
     # loads images in a mosaic
@@ -719,7 +1223,8 @@ def letterbox(img, new_shape=(416, 416), color=(114, 114, 114), auto=True, scale
     new_unpad = int(round(shape[1] * r)), int(round(shape[0] * r))
     dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]  # wh padding
     if auto:  # minimum rectangle
-        dw, dh = np.mod(dw, 64), np.mod(dh, 64)  # wh padding
+        # dw, dh = np.mod(dw, 64), np.mod(dh, 64)  # wh padding
+        dw, dh = np.mod(dw, 32), np.mod(dh, 32)  # wh padding   # should be 32? 20201224
     elif scaleFill:  # stretch
         dw, dh = 0.0, 0.0
         new_unpad = new_shape
@@ -736,7 +1241,7 @@ def letterbox(img, new_shape=(416, 416), color=(114, 114, 114), auto=True, scale
     return img, ratio, (dw, dh)
 
 
-def random_affine_xywhr(img, targets=(), degrees=10, translate=.1, scale=.1, border=0):
+def random_affine_xywhr(img, targets=(), degrees=10, translate=.1, scale=.1, border=0, mask=None):
     ### to adapt to rotated bbox, we do not accept shear augmentation here. 
     ### different from random_affine() which takes xyxy as target input, 
     ### here we take xywhr as input (but denormalized to pixel) because we want to preserve the rectangle property
@@ -763,6 +1268,8 @@ def random_affine_xywhr(img, targets=(), degrees=10, translate=.1, scale=.1, bor
     M = T @ R  # ORDER IS IMPORTANT HERE!!
     if (border != 0) or (M != np.eye(3)).any():  # image changed
         img = cv2.warpAffine(img, M[:2], dsize=(width, height), flags=cv2.INTER_LINEAR, borderValue=(114, 114, 114))
+        if mask is not None:
+            mask = cv2.warpAffine(mask, M[:2], dsize=(width, height), flags=cv2.INTER_LINEAR, borderValue=(114, 114, 114))
 
     # Transform label coordinates
     n = len(targets)
@@ -779,6 +1286,15 @@ def random_affine_xywhr(img, targets=(), degrees=10, translate=.1, scale=.1, bor
             yaw_new = yaw + a*np.pi/180
 
             xywh_r = np.concatenate((x0y0_new, wh_new, yaw_new), axis=1)
+        elif targets.shape[1] == 8:
+            yaw = targets[:, [5]]
+            yaw_new = yaw + a*np.pi/180
+
+            x1y1 = np.ones((n, 3))
+            x1y1[:, :2] = targets[:, [1,2]] + targets[:, [6,7]]
+            x1y1_new = (x1y1 @ M.T)[:, :2]
+            dxdy = x1y1_new - x0y0_new
+            xywh_r = np.concatenate((x0y0_new, wh_new, yaw_new, dxdy), axis=1)
         else:
             xywh_r = np.concatenate((x0y0_new, wh_new), axis=1)
 
@@ -793,9 +1309,9 @@ def random_affine_xywhr(img, targets=(), degrees=10, translate=.1, scale=.1, bor
         targets = targets[i]
         targets[:, 1:] = xywh_r[i]
 
-    return img, targets
+    return img, targets, mask
 
-def random_affine(img, targets=(), degrees=10, translate=.1, scale=.1, shear=10, border=0):
+def random_affine(img, targets=(), degrees=10, translate=.1, scale=.1, shear=10, border=0, mask=None):
     # torchvision.transforms.RandomAffine(degrees=(-10, 10), translate=(.1, .1), scale=(.9, 1.1), shear=(-10, 10))
     # https://medium.com/uruvideo/dataset-augmentation-with-random-homographies-a8f4b44830d4
     # targets = [cls, xyxy]
@@ -825,6 +1341,9 @@ def random_affine(img, targets=(), degrees=10, translate=.1, scale=.1, shear=10,
     M = S @ T @ R  # ORDER IS IMPORTANT HERE!!
     if (border != 0) or (M != np.eye(3)).any():  # image changed
         img = cv2.warpAffine(img, M[:2], dsize=(width, height), flags=cv2.INTER_LINEAR, borderValue=(114, 114, 114))
+        if mask is not None:
+            mask = cv2.warpAffine(mask, M[:2], dsize=(width, height), flags=cv2.INTER_LINEAR, borderValue=(114, 114, 114))
+
 
     # Transform label coordinates
     n = len(targets)
@@ -861,7 +1380,7 @@ def random_affine(img, targets=(), degrees=10, translate=.1, scale=.1, shear=10,
         targets = targets[i]
         targets[:, 1:5] = xy[i]
 
-    return img, targets
+    return img, targets, mask
 
 
 def cutout(image, labels):

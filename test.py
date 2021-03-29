@@ -26,7 +26,13 @@ def test(cfg,
          half_angle=False,
          id=0, 
          output_path=None, 
-         bev_dataset=False):
+         bev_dataset=False, 
+         tail=False, 
+         tail_inv=False, 
+         dual_view=False, 
+         use_mask=False, 
+         riou=False, 
+         giou_loss=False):
     ### opt is accessible only when called in this script itself, where opt is declared outside of functions, therefore a global variable
     ### you are also able to change members in opt, since opt is a mutable object. You cannot modify an immutable object as a global variable in a function, except you declare it as global first in the function. 
     ### https://stackoverflow.com/questions/31435603/python-modify-global-list-inside-a-function
@@ -37,11 +43,11 @@ def test(cfg,
         verbose = opt.task == 'test'
 
         # Remove previous
-        for f in glob.glob('test_batch*.jpg'):
+        for f in glob.glob('results/test_batch*.jpg'):
             os.remove(f)
 
         # Initialize model
-        model = Darknet(cfg, imgsz, rotated=rotated, half_angle=half_angle)
+        model = Darknet(cfg, imgsz, rotated=rotated, half_angle=half_angle, tail=tail, tail_inv=tail_inv, rotated_anchor=rotated_anchor, dual_view=dual_view)
 
         # Load weights
         attempt_download(weights)
@@ -78,51 +84,89 @@ def test(cfg,
 
     # Dataloader
     if dataloader is None:
-        dataset = LoadImagesAndLabels(path, data.rsplit(".", 1)[0]+"_valid", imgsz, batch_size, rect=True, single_cls=single_cls, rotated=rotated, half_angle=half_angle, bev_dataset=bev_dataset)
-        batch_size = min(batch_size, len(dataset))
-        dataloader = DataLoader(dataset,
-                                batch_size=batch_size,
-                                num_workers=min([os.cpu_count(), batch_size if batch_size > 1 else 0, 8]),
-                                pin_memory=True,
-                                collate_fn=dataset.collate_fn)
+        if not dual_view:
+            dataset = LoadImagesAndLabels(path, data.rsplit(".", 1)[0]+"_valid", imgsz, batch_size, rect=True, single_cls=single_cls, rotated=rotated, half_angle=half_angle, bev_dataset=bev_dataset, tail=tail, use_mask=use_mask)
+            batch_size = min(batch_size, len(dataset))
+            dataloader = DataLoader(dataset,
+                                    batch_size=batch_size,
+                                    num_workers=min([os.cpu_count(), batch_size if batch_size > 1 else 0, 8]),
+                                    pin_memory=True,
+                                    collate_fn=dataset.collate_fn)
+        else:
+
+            dataset_bev = LoadImagesAndLabels(path, data.rsplit(".", 1)[0]+"_valid", imgsz, batch_size, rect=True, single_cls=single_cls, rotated=rotated, half_angle=half_angle, bev_dataset=bev_dataset, tail=tail, dual_view_first=True, use_mask=use_mask)
+            
+            dataset_ori = LoadImagesAndLabels(path, data.rsplit(".", 1)[0]+"_valid", imgsz, batch_size, rect=True, single_cls=single_cls, rotated=rotated, half_angle=half_angle, bev_dataset=bev_dataset, tail=tail, dual_view_second=True, i_files=dataset_bev.i_files, use_mask=use_mask)
+            
+            dataset = LoadImagesAndLabelsDual(dataset_bev, dataset_ori)
+
+            batch_size = min(batch_size, len(dataset))
+            dataloader = DataLoader(dataset,
+                                    batch_size=batch_size,
+                                    num_workers=min([os.cpu_count(), batch_size if batch_size > 1 else 0, 8]),
+                                    pin_memory=True,
+                                    collate_fn=dataset.collate_fn)
+            
 
     seen = 0
     model.eval()
-    _ = model(torch.zeros((1, 3, imgsz, imgsz), device=device)) if device.type != 'cpu' else None  # run once
+    if not dual_view:
+        _ = model(torch.zeros((1, 3, imgsz, imgsz), device=device)) if device.type != 'cpu' else None  # run once
+    else:
+        _ = model(torch.zeros((1, 3, imgsz, imgsz), device=device), x_sec_view=torch.zeros((1, 3, imgsz, imgsz), device=device), H_img_bev=torch.zeros((1, 3, 3, 3), device=device)) if device.type != 'cpu' else None  # run once
+
     coco91class = coco80_to_coco91_class()
     s = ('%20s' + '%10s' * 6) % ('Class', 'Images', 'Targets', 'P', 'R', 'mAP@0.5', 'F1')
     p, r, f1, mp, mr, map, mf1, t0, t1 = 0., 0., 0., 0., 0., 0., 0., 0., 0.
     # loss = torch.zeros(3, device=device)
-    loss = torch.zeros(6, device=device)       ### to be compatible with rotated bbox, the loss contains 6 terms (adding lxy, lwh, lr)
+    loss = torch.zeros(7, device=device)       ### to be compatible with rotated bbox, the loss contains 6 terms (adding lxy, lwh, lr, ltt)
 
     if rotated:
-        cls_idx = 6
-        conf_idx = 5
+        if tail:
+            cls_idx = 8
+            conf_idx = 7
+        else:
+            cls_idx = 6
+            conf_idx = 5
     else:
         cls_idx = 5
         conf_idx = 4
     jdict, stats, ap, ap_class = [], [], [], []
-    for batch_i, (imgs, targets, paths, shapes) in enumerate(tqdm(dataloader, desc=s)):
+    for batch_i, sample_batch in enumerate(tqdm(dataloader, desc=s)):
+        
+        if dual_view:
+            imgs, invalid_masks, targets, paths, shapes, oris, shapes_oris, H_img_bev = sample_batch
+            oris = oris.to(device).float() / 255.0  # uint8 to float32, 0 - 255 to 0.0 - 1.0
+            H_img_bev = H_img_bev.to(device).float()
+        else:
+            imgs, invalid_masks, targets, paths, shapes = sample_batch
+
         imgs = imgs.to(device).float() / 255.0  # uint8 to float32, 0 - 255 to 0.0 - 1.0
         targets = targets.to(device)
         nb, _, height, width = imgs.shape  # batch size, channels, height, width
         whwh = torch.Tensor([width, height, width, height]).to(device)
 
+        invalid_masks = [x.to(device).float() / 255.0 if x is not None else None for x in invalid_masks]
+
         # Disable gradients
         with torch.no_grad():
             # Run model
             t = torch_utils.time_synchronized()
-            inf_out, train_out = model(imgs, augment=augment)  # inference and training outputs
+            if not dual_view:
+                inf_out, train_out = model(imgs, augment=augment)  # inference and training outputs
+            else:
+                inf_out, train_out = model(imgs, augment=augment, x_sec_view=oris, H_img_bev=H_img_bev)  # inference and training outputs
+
             t0 += torch_utils.time_synchronized() - t
 
             # Compute loss
             if hasattr(model, 'hyp'):  # if model has loss hyperparameters
                 # loss += compute_loss(train_out, targets, model)[1][:3]  # GIoU, obj, cls
-                loss += compute_loss(train_out, targets, model, half_angle=half_angle)[1][:6]  # GIoU, obj, cls, xy, wh, rotation (rotated or not)
+                loss += compute_loss(train_out, targets, model, use_giou_loss=giou_loss, half_angle=half_angle, tail_inv=tail_inv)[1][:7]  # GIoU, obj, cls, xy, wh, rotation, tt (rotated or not)
 
             # Run NMS
             t = torch_utils.time_synchronized()
-            output = non_max_suppression(inf_out, conf_thres=conf_thres, iou_thres=iou_thres, multi_label=multi_label, rotated=rotated, rotated_anchor=rotated_anchor)
+            output = non_max_suppression(inf_out, conf_thres=conf_thres, iou_thres=iou_thres, multi_label=multi_label, rotated=rotated, rotated_anchor=rotated_anchor, tail=tail, invalid_masks=invalid_masks)
             t1 += torch_utils.time_synchronized() - t
 
         # Statistics per image
@@ -188,8 +232,15 @@ def test(cfg,
                         if not rotated:
                             ious, i = box_iou(pred[pi, :4], tbox[ti]).max(1)  # best ious, indices
                         else:
-                            # ious, i = d3d.box.box2d_iou(pred[pi, :5], tbox[ti], method="rbox").max(1)
-                            ious, i = lin_iou(pred[pi, :5], tbox[ti]).max(1)
+                            if riou:
+                                # ious, i = d3d.box.box2d_iou(pred[pi, :5], tbox[ti], method="rbox").max(1)
+                                pred_d3d = pred[pi, :5].clone()
+                                pred_d3d[:,4] = -pred_d3d[:,4]
+                                tbox_d3d = tbox[ti].clone()
+                                tbox_d3d[:,4] = -tbox_d3d[:,4]
+                                ious, i = d3d.box.box2d_iou(pred_d3d, tbox_d3d, method="rbox").max(1)
+                            else:
+                                ious, i = lin_iou(pred[pi, :5], tbox[ti]).max(1)
                             # print(ious.shape)
                             # print("ious.max()", ious.max())
                             # print("ious.min()", ious.min())
@@ -209,13 +260,16 @@ def test(cfg,
 
         # Plot images
         if batch_i < 5:
-            f = 'test_batch%g_gt.jpg' % batch_i  # filename
+            f = 'results/test_batch%g_gt.jpg' % batch_i  # filename
             plot_images(imgs, targets, paths=paths, names=names, fname=f)  # ground truth
-            f = 'test_batch%g_pred%d.jpg' % (batch_i, id)
+            f = 'results/test_batch%g_pred%d.jpg' % (batch_i, id)
             if not rotated:
                 plot_images(imgs, output_to_target(output, width, height), paths=paths, names=names, fname=f, gt=False)  # predictions
             else:
-                plot_images(imgs, output_to_target_r(output, width, height), paths=paths, names=names, fname=f, gt=False)  # predictions
+                if tail:
+                    plot_images(imgs, output_to_target_rtt(output, width, height), paths=paths, names=names, fname=f, gt=False)  # predictions
+                else:
+                    plot_images(imgs, output_to_target_r(output, width, height), paths=paths, names=names, fname=f, gt=False)  # predictions
 
     # Compute statistics
     stats = [np.concatenate(x, 0) for x in zip(*stats)]  # to numpy
@@ -264,7 +318,7 @@ def test(cfg,
     if output_path is not None:
         with open(output_path, "a") as f:
             result_dict = {}
-            result_dict["PR_conf_thresh(except AP)"] = 0.1 # see ap_per_class class
+            result_dict["PR_conf_thresh(except AP)"] = conf_thres # 0.1 # see ap_per_class class
             result_dict["iou_thresh"] = iouv.tolist()
             result_dict["n_images"] = seen
             result_dict["n_targets"] = nt.sum().item()
@@ -339,15 +393,24 @@ if __name__ == '__main__':
     parser.add_argument('--half-angle', action='store_true', help='use 180 degree instead of 360 degree in direction estimation (forward-backward equivalent)')
     parser.add_argument('--save-txt', action='store_true', help='save evaluation quantitative results to *.txt')
     parser.add_argument('--bev-dataset', action='store_true', help='use dataset of customized unified structure for bev')
+    parser.add_argument('--tail', action='store_true', help='predict tail along with rbox')
+    parser.add_argument('--tail-inv', action='store_true', help='predict tail along with rbox, with the xy origin at the end of tail')
+    parser.add_argument('--dual-view', action='store_true', help='use both bev and original view as input')
+    parser.add_argument('--use-mask', action='store_true', help='use invalid region mask to mask out some regions (do not want detections there)')
+    parser.add_argument('--riou', action='store_true', help='use riou threshold in quantitative evaluation')
+    parser.add_argument('--giou-loss', action='store_true', help='use giou in loss function')
     opt = parser.parse_args()
     opt.save_json = opt.save_json or any([x in opt.data for x in ['coco.data', 'coco2014.data', 'coco2017.data']])
     opt.cfg = list(glob.iglob('./**/' + opt.cfg, recursive=True))[0]  # find file
-    opt.data = list(glob.iglob('./**/' + opt.data, recursive=True))[0]  # find file
+    # opt.data = list(glob.iglob('./**/' + opt.data, recursive=True))[0]  # find file
     print(opt)
 
     ### save arguments to file
     if opt.save_txt:
-        output_path = "test_result_d_{}_w_{}.txt".format(opt.data.split("/")[-1].split(".")[0], opt.weights.split("/")[-1].split(".")[0])
+        if opt.riou:
+            output_path = "results/riou_test_result_d_{}_w_{}.txt".format(opt.data.split("/")[-1].split(".")[0], opt.weights.split("/")[-1].split(".")[0])
+        else:
+            output_path = "results/liou_test_result_d_{}_w_{}.txt".format(opt.data.split("/")[-1].split(".")[0], opt.weights.split("/")[-1].split(".")[0])
         with open(output_path, "w") as f:
             to_save = opt.__dict__.copy()
             json.dump(to_save, f, indent=2)
@@ -371,7 +434,13 @@ if __name__ == '__main__':
              rotated_anchor=opt.rotated_anchor, 
              output_path=output_path, 
              half_angle=opt.half_angle, 
-             bev_dataset=opt.bev_dataset)
+             bev_dataset=opt.bev_dataset, 
+             tail=opt.tail, 
+             tail_inv=opt.tail_inv, 
+             dual_view=opt.dual_view, 
+             use_mask=opt.use_mask, 
+             riou=opt.riou, 
+             giou_loss=opt.giou_loss)
 
     elif opt.task == 'benchmark':  # mAPs at 256-640 at conf 0.5 and 0.7
         y = []

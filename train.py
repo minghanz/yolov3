@@ -12,6 +12,7 @@ from utils.utils import *
 from utils.sampler import BatchFrozenSampler
 
 import torchsnooper
+import json
 
 mixed_precision = True
 try:  # Mixed precision training https://github.com/NVIDIA/apex
@@ -23,7 +24,8 @@ except:
 wdir = 'weights' + os.sep  # weights dir
 last = wdir + 'last.pt'
 best = wdir + 'best.pt'
-results_file = 'results.txt'
+rdir = 'results' + os.sep       ## added 11132020
+results_file = rdir + 'results.txt'
 
 # Hyperparameters
 hyp = {'giou': 3.54,  # giou loss gain
@@ -46,10 +48,17 @@ hyp = {'giou': 3.54,  # giou loss gain
        'shear': 0.641 * 0}  # image shear (+/- deg)
 
 ## for traffic cam
-hyp.update({
-    'xy': 4.062, 
-    'wh': 0.1845,
-    'r': 4.062 })#4.062
+# hyp.update({
+#     'xy': 4.062, 
+#     'wh': 0.1845,
+#     'r': 4.062, 
+#     'tt': 0.01845, })#4.062
+# hyp.update({
+#     'xy': 0.1845, 
+#     'wh': 0.1845,
+#     'r': 4.062, 
+#     'tt': 4.062,
+#     'giou': 0.0354 })### tail_inv
 # ### for kitti
 # hyp.update({
 #     'xy': 4.062, 
@@ -67,6 +76,34 @@ hyp.update({
     #    'lrf': -4.,  # final learning rate = lr0 * (10 ** lrf)
     #    'momentum': 0.90,  # SGD momentum
     #    'weight_decay': 0.0005}  # optimizer weight decay
+
+def set_hyp_by_opt(opt):
+    if opt.tail_inv:
+        hyp.update({
+            'xy': 0.1845, 
+            'wh': 0.1845,
+            'r': 4.062, 
+            'tt': 4.062,
+            'giou': 0.0354 })### tail_inv
+    else:
+        hyp.update({
+            'xy': 4.062, 
+            'wh': 0.1845,
+            'r': 4.062, 
+            'tt': 0.01845, })#4.062
+    return
+
+def save_cfg(opt, hyp):
+    fpath = wdir + "cfg_" + opt.name + ".txt"
+    if not os.path.exists(os.path.dirname(fpath)):
+        os.makedirs(os.path.dirname(fpath))
+    with open(fpath, "w") as f:
+        f.write(time.ctime() + "\n")
+        opt_dict = opt.__dict__.copy()
+        json.dump(opt_dict, f, indent=2)
+        f.write("\n")
+        json.dump(hyp, f, indent=2)
+        print("cfg file saved to {}".format(fpath))
 
 # Overwrite hyp with hyp*.txt (optional)
 f = glob.glob('hyp*.txt')
@@ -94,6 +131,9 @@ def train(hyp):
     rotated_anchor = opt.rotated_anchor
     half_angle = opt.half_angle
 
+    dual_view = opt.dual_view
+    use_mask = opt.use_mask
+
     # Image Sizes
     gs = 32 # 64  # (pixels) grid size
     assert math.fmod(imgsz_min, gs) == 0, '--img-size %g must be a %g-multiple' % (imgsz_min, gs)
@@ -119,11 +159,11 @@ def train(hyp):
     hyp['cls'] *= nc / 80  # update coco-tuned hyp['cls'] to current dataset
 
     # Remove previous results
-    for f in glob.glob('*_batch*.jpg') + glob.glob(results_file):
+    for f in glob.glob(rdir+'*_batch*.jpg') + glob.glob(results_file):
         os.remove(f)
 
     # Initialize model
-    model = Darknet(cfg, rotated=rotated).to(device)
+    model = Darknet(cfg, rotated=rotated, half_angle=half_angle, tail=opt.tail, tail_inv=opt.tail_inv, rotated_anchor=rotated_anchor, dual_view=dual_view).to(device)
 
     # Optimizer
     pg0, pg1, pg2 = [], [], []  # optimizer parameter groups
@@ -141,6 +181,7 @@ def train(hyp):
         # optimizer = AdaBound(pg0, lr=hyp['lr0'], final_lr=0.1)
     else:
         optimizer = optim.SGD(pg0, lr=hyp['lr0'], momentum=hyp['momentum'], nesterov=True)
+        # optimizer = optim.SGD(pg1, lr=hyp['lr0'], momentum=hyp['momentum'], nesterov=True, weight_decay=hyp['weight_decay'])  # add pg1 with weight_decay       # VISMODE1113 do not have pg0
     optimizer.add_param_group({'params': pg1, 'weight_decay': hyp['weight_decay']})  # add pg1 with weight_decay
     optimizer.add_param_group({'params': pg2})  # add pg2 (biases)
     print('Optimizer groups: %g .bias, %g Conv2d.weight, %g other' % (len(pg2), len(pg1), len(pg0)))
@@ -155,17 +196,75 @@ def train(hyp):
 
         # load model
         try:
-            chkpt['model'] = {k: v for k, v in chkpt['model'].items() if model.state_dict()[k].numel() == v.numel()}
-            model.load_state_dict(chkpt['model'], strict=False)
+            # ### VISMODE1113 manually set the weight to identical mapping
+            # for key in chkpt['model']:
+            #     if 'Conv2d' in key:
+            #         # print("{}:".format(key), chkpt['model'][key].shape)
+            #         if 'weight' in key:
+            #             chkpt['model'][key] = torch.zeros_like(chkpt['model'][key])
+            #             filter_h = chkpt['model'][key].shape[2]
+            #             filter_w = chkpt['model'][key].shape[3]
+            #             mid_h = int((filter_h - 1) / 2)
+            #             mid_w = int((filter_w - 1) / 2)
+            #             chkpt['model'][key][0,0,mid_h, mid_w] = 1
+            #             chkpt['model'][key][1,1,mid_h, mid_w] = 1
+            #             chkpt['model'][key][2,2,mid_h, mid_w] = 1
+            #         elif 'bias' in key:
+            #             chkpt['model'][key] = torch.zeros_like(chkpt['model'][key])
+                        
+
+            if not dual_view or "yolov3-spp-ultralytics" not in weights:
+                chkpt['model'] = {k: v for k, v in chkpt['model'].items() if model.state_dict()[k].numel() == v.numel()}
+                model.load_state_dict(chkpt['model'], strict=False)
+            else:
+                chkpt_keys = [k for k in chkpt['model'] ]
+                modify_keys = [k for k in chkpt['model'] if k[:12] == "module_list." and k.split(".")[1].isdigit() and int(k.split(".")[1]) > 61 ]
+                modify_key_mapping = {k: k.replace(k.split(".")[1], str(int(k.split(".")[1])+1)) if k in modify_keys else k for k in chkpt['model'] }
+                additional_key_mapping = {k: k.replace("module_list.", "module_list_sub.") for k in chkpt['model'] if k[:12] == "module_list." and k.split(".")[1].isdigit() and int(k.split(".")[1]) <= 61 }
+
+                for idx in [62, 94, 106]:
+                    modify_weight = chkpt['model']['module_list.{}.Conv2d.weight'.format(idx)].clone()
+                    modify_weight_chn = modify_weight.shape[1]
+                    if idx in [94, 106]:
+                        assert modify_weight_chn % 3 == 0
+                        modify_weight[:, modify_weight_chn//3:] = modify_weight[:, modify_weight_chn//3:] * 0.5
+                        new_weight = torch.cat([modify_weight, modify_weight[:, modify_weight_chn//3:]], dim=1) # for accepting dual view features
+                    else:
+                        modify_weight = modify_weight * 0.5
+                        new_weight = torch.cat([modify_weight, modify_weight], dim=1) # for accepting dual view features
+                    chkpt['model']['module_list.{}.Conv2d.weight'.format(idx)] = new_weight
+
+                chkpt_new = {modify_key_mapping[k]: v for k, v in chkpt['model'].items() if model.state_dict()[modify_key_mapping[k]].numel() == v.numel() }
+                chkpt_new.update({additional_key_mapping[k]: chkpt['model'][k] for k in additional_key_mapping if model.state_dict()[additional_key_mapping[k]].numel() == chkpt['model'][k].numel()  })
+
+                # ### VISMODE1113 the model has fewer keys than checkpoint
+                # chkpt_new = {modify_key_mapping[k]: v for k, v in chkpt['model'].items() if modify_key_mapping[k] in model.state_dict() and model.state_dict()[modify_key_mapping[k]].numel() == v.numel() }
+                # chkpt_new.update({additional_key_mapping[k]: chkpt['model'][k] for k in additional_key_mapping if additional_key_mapping[k] in model.state_dict() and model.state_dict()[additional_key_mapping[k]].numel() == chkpt['model'][k].numel()  })
+
+                for idx in [62, 94, 106]:
+                    test_key = 'module_list.{}.Conv2d.weight'.format(idx)
+                    test_key_new = 'module_list.{}.Conv2d.weight'.format(idx+1)
+                    
+                    assert test_key_new in chkpt_new, "{}: {}, model {}, chkpt_new {}".format(test_key, chkpt['model'][test_key].shape, model.state_dict()[test_key].shape, chkpt_new[test_key_new].shape)
+                    
+                model.load_state_dict(chkpt_new, strict=False)
+
+                
         except KeyError as e:
             s = "%s is not compatible with %s. Specify --weights '' or specify a --cfg compatible with %s. " \
                 "See https://github.com/ultralytics/yolov3/issues/657" % (opt.weights, opt.cfg, opt.weights)
             raise KeyError(s) from e
 
         # load optimizer
+        # if False:
         if chkpt['optimizer'] is not None:
             optimizer.load_state_dict(chkpt['optimizer'])
             best_fitness = chkpt['best_fitness']
+            
+            print("loading optimizer:", optimizer.param_groups[0]['lr'])
+        else:
+            
+            print("Not loading optimizer")
 
         # load results
         if chkpt.get('training_results') is not None:
@@ -187,6 +286,7 @@ def train(hyp):
     lf = lambda x: (((1 + math.cos(x * math.pi / epochs)) / 2) ** 1.0) * 0.95 + 0.05  # cosine
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
     scheduler.last_epoch = start_epoch - 1  # see link below
+    # scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf, last_epoch=start_epoch-1)    ## weight is loaded this way
     # https://discuss.pytorch.org/t/a-problem-occured-when-resuming-an-optimizer/28822
 
     # Plot lr schedule
@@ -209,16 +309,46 @@ def train(hyp):
         model = torch.nn.parallel.DistributedDataParallel(model, find_unused_parameters=True)
         model.yolo_layers = model.module.yolo_layers  # move yolo layer indices to top level
 
-    # Dataset
-    dataset = LoadImagesAndLabels(train_path, opt.data.rsplit(".", 1)[0]+"_train", img_size, batch_size,
-                                  augment=True,
-                                  hyp=hyp,  # augmentation hyperparameters
-                                  rect=opt.rect,  # rectangular training
-                                  cache_images=opt.cache_images,
-                                  single_cls=opt.single_cls, 
-                                  rotated=rotated, 
-                                  half_angle=half_angle, 
-                                  bev_dataset=opt.bev_dataset)
+    if not dual_view:
+        # Dataset
+        dataset = LoadImagesAndLabels(train_path, opt.data.rsplit(".", 1)[0]+"_train", img_size, batch_size,
+                                    augment=True,
+                                    hyp=hyp,  # augmentation hyperparameters
+                                    rect=opt.rect,  # rectangular training
+                                    cache_images=opt.cache_images,
+                                    single_cls=opt.single_cls, 
+                                    rotated=rotated, 
+                                    half_angle=half_angle, 
+                                    bev_dataset=opt.bev_dataset, 
+                                    tail=opt.tail)
+    else:
+        # Dataset
+        dataset_bev = LoadImagesAndLabels(train_path, opt.data.rsplit(".", 1)[0]+"_train", img_size, batch_size,
+                                    augment=True,
+                                    hyp=hyp,  # augmentation hyperparameters
+                                    rect=opt.rect,  # rectangular training
+                                    cache_images=opt.cache_images,
+                                    single_cls=opt.single_cls, 
+                                    rotated=rotated, 
+                                    half_angle=half_angle, 
+                                    bev_dataset=opt.bev_dataset, 
+                                    tail=opt.tail, 
+                                    dual_view_first=True)
+        # Dataset
+        dataset_ori = LoadImagesAndLabels(train_path, opt.data.rsplit(".", 1)[0]+"_ori_train", img_size, batch_size,
+                                    augment=True,
+                                    hyp=hyp,  # augmentation hyperparameters
+                                    rect=opt.rect,  # rectangular training
+                                    cache_images=opt.cache_images,
+                                    single_cls=opt.single_cls, 
+                                    rotated=rotated, 
+                                    half_angle=half_angle, 
+                                    bev_dataset=opt.bev_dataset, 
+                                    tail=opt.tail, 
+                                    dual_view_second=True, 
+                                    i_files=dataset_bev.i_files)
+        dataset = LoadImagesAndLabelsDual(dataset_bev, dataset_ori)
+
 
     ### batch sampler
     sampler = BatchFrozenSampler(len(dataset), batch_size, True)
@@ -240,14 +370,44 @@ def train(hyp):
                                              collate_fn=dataset.collate_fn)
 
     # Testloader
-    testloader = torch.utils.data.DataLoader(LoadImagesAndLabels(test_path, opt.data.rsplit(".", 1)[0]+"_valid", imgsz_test, batch_size,
-                                                                 hyp=hyp,
-                                                                 rect=True,
-                                                                 cache_images=opt.cache_images,
-                                                                 single_cls=opt.single_cls, 
-                                                                 rotated=rotated, 
-                                                                 half_angle=half_angle, 
-                                                                 bev_dataset=opt.bev_dataset), 
+    if not dual_view:
+        test_set = LoadImagesAndLabels(test_path, opt.data.rsplit(".", 1)[0]+"_valid", imgsz_test, batch_size,
+                                        hyp=hyp,
+                                        rect=True,
+                                        cache_images=opt.cache_images,
+                                        single_cls=opt.single_cls, 
+                                        rotated=rotated, 
+                                        half_angle=half_angle, 
+                                        bev_dataset=opt.bev_dataset, 
+                                        tail=opt.tail, 
+                                        use_mask=use_mask)
+    else:
+        test_set_bev = LoadImagesAndLabels(test_path, opt.data.rsplit(".", 1)[0]+"_valid", imgsz_test, batch_size,
+                                        hyp=hyp,
+                                        rect=True,
+                                        cache_images=opt.cache_images,
+                                        single_cls=opt.single_cls, 
+                                        rotated=rotated, 
+                                        half_angle=half_angle, 
+                                        bev_dataset=opt.bev_dataset, 
+                                        tail=opt.tail, 
+                                        dual_view_first=True, 
+                                        use_mask=use_mask)
+        test_set_ori = LoadImagesAndLabels(test_path, opt.data.rsplit(".", 1)[0]+"_ori_valid", imgsz_test, batch_size,
+                                        hyp=hyp,
+                                        rect=True,
+                                        cache_images=opt.cache_images,
+                                        single_cls=opt.single_cls, 
+                                        rotated=rotated, 
+                                        half_angle=half_angle, 
+                                        bev_dataset=opt.bev_dataset, 
+                                        tail=opt.tail, 
+                                        dual_view_second=True, 
+                                        i_files=test_set_bev.i_files, 
+                                        use_mask=use_mask)
+        test_set = LoadImagesAndLabelsDual(test_set_bev, test_set_ori)
+
+    testloader = torch.utils.data.DataLoader(test_set, 
                                              batch_size=batch_size,
                                              num_workers=nw,
                                              pin_memory=True,
@@ -311,8 +471,19 @@ def train(hyp):
     #         torch.save(chkpt, best)
 
     with open(results_file, 'a') as f:  
-        f.write('%10s' * (11+10) % ('epochs', 'mem_cache', 'lbox', 'lobj', 'lcls', 'lxy', 'lwh', 'lr', 'tot_loss', 'n_targets', 'longside', 'test:mP', 'mR', 'mAP', 'mF1', 'lbox', 'lobj', 'lcls', 'lxy', 'lwh', 'lr')+'\n')
+        f.write('%10s' * (12+11) % ('epochs', 'mem_cache', 'lbox', 'lobj', 'lcls', 'lxy', 'lwh', 'lr', 'ltt', 'tot_loss', 'n_targets', 'longside', 'test:mP', 'mR', 'mAP', 'mF1', 'lbox', 'lobj', 'lcls', 'lxy', 'lwh', 'lr', 'ltt')+'\n')
 
+    writer_vis = None
+    # ### VISMODE1113
+    # import socket
+    # from datetime import datetime
+    # current_time = datetime.now().strftime('%b%d_%H-%M-%S')
+    # log_dir = os.path.join(
+    #     'vis_feature', current_time + '_' + socket.gethostname())
+    # writer_vis = SummaryWriter(log_dir)
+
+    torch.cuda.empty_cache()
+    torch.cuda.empty_cache()
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         model.train()
 
@@ -323,11 +494,17 @@ def train(hyp):
             dataset.indices = random.choices(range(dataset.n), weights=image_weights, k=dataset.n)  # rand weighted idx
 
         # mloss = torch.zeros(4).to(device)  # mean losses
-        mloss = torch.zeros(7).to(device)  # mean losses    # to be compatible with rotated cases
+        mloss = torch.zeros(8).to(device)  # mean losses    # to be compatible with rotated cases and tail prediction
         # print(('\n' + '%10s' * 8) % ('Epoch', 'gpu_mem', 'GIoU', 'obj', 'cls', 'total', 'targets', 'img_size'))
-        print(('\n' + '%10s' * 11) % ('Epoch', 'gpu_mem', 'GIoU', 'obj', 'cls', 'xy', 'wh', 'r', 'total', 'targets', 'img_size'))
+        print(('\n' + '%10s' * 12) % ('Epoch', 'gpu_mem', 'GIoU', 'obj', 'cls', 'xy', 'wh', 'r', 'tt', 'total', 'targets', 'img_size'))
         pbar = tqdm(enumerate(dataloader), total=nb)  # progress bar
-        for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
+        for i, sample_batch in pbar:  # batch -------------------------------------------------------------
+            if dual_view:
+                imgs, invalid_masks, targets, paths, _, oris, _, H_img_bev = sample_batch
+                oris = oris.to(device).float() / 255.0  # uint8 to float32, 0 - 255 to 0.0 - 1.0
+                H_img_bev = H_img_bev.to(device).float()
+            else:
+                imgs, invalid_masks, targets, paths, _ = sample_batch
             ni = i + nb * epoch  # number integrated batches (since train start)
             imgs = imgs.to(device).float() / 255.0  # uint8 to float32, 0 - 255 to 0.0 - 1.0
             targets = targets.to(device)
@@ -355,12 +532,65 @@ def train(hyp):
                 if sf != 1:
                     ns = [math.ceil(x * sf / gs) * gs for x in imgs.shape[2:]]  # new shape (stretched to 32-multiple)
                     imgs = F.interpolate(imgs, size=ns, mode='bilinear', align_corners=False)
+                    invalid_masks = [F.interpolate(x, size=ns, mode='bilinear', align_corners=False) if x is not None else None for x in invalid_masks]
 
             # Forward
-            pred = model(imgs)
+            if not dual_view:
+                pred = model(imgs)
+            else:
+                ## VISMODE1113 make sure image is positive
+                # print("imgs max min", imgs.max(), imgs.min())   # 0-1
+                # print("oris max min", oris.max(), oris.min())
+                # print("imgs oris", imgs.size(), oris.size())
+                # if epoch == start_epoch and i % 1000 == 0:
+                if writer_vis is not None:
+                    writer_vis.add_images("bevs", imgs, i)
+                    writer_vis.add_images("oris", oris, i)
+                    for ib in range(imgs.shape[0]):
+                        writer_vis.add_image("imgs/%d"%ib, imgs[ib], i)
+                        writer_vis.add_image("oris/%d"%ib, oris[ib], i)
+
+                    ##########################################################        ## testing the correctness of the H
+                    grid_shape = imgs.shape
+                    height = grid_shape[2]
+                    width = grid_shape[3]
+                    batch_size = grid_shape[0]
+                    # xs = torch.linspace(-1, 1, width)   # if align_corners==True, the corner pixel center is -1 / 1
+                    # ys = torch.linspace(-1, 1, height)  # if align_corners==False, the corner of corner pixels is -1 / 1, thererfore the corner pixel center is not -1 / 1
+                    xs = torch.arange(width) + 0.5
+                    ys = torch.arange(height) + 0.5
+                    # xs = (torch.arange(width) + 0.5) / width * 2 - 1
+                    # ys = (torch.arange(height) + 0.5) / height * 2 - 1
+                    
+                    base_grid = torch.stack(
+                        torch.meshgrid([xs, ys])).transpose(1, 2).to(device=imgs.device, dtype=imgs.dtype)  # 2xHxW
+                    base_grid = torch.unsqueeze(base_grid, dim=0).permute(0, 2, 3, 1).expand(batch_size, -1, -1, -1)  # BxHxWx2
+                    grid_flat = base_grid.reshape(batch_size, -1, 2)    # B*N*2
+                    grid_flat_homo = torch.nn.functional.pad(grid_flat, (0, 1), "constant", 1.0)    # B*N*3
+
+                    H_to_use = H_img_bev[:, 0] # B*3*3
+
+                    grid_warped_flat_homo = torch.matmul(
+                        H_to_use.unsqueeze(1), grid_flat_homo.unsqueeze(-1))    # B*1*3*3 x B*N*3*1 => B*N*3*1
+                    grid_warped_flat_homo = torch.squeeze(grid_warped_flat_homo, dim=-1)    # B*N*3
+
+                    grid_warped_flat = grid_warped_flat_homo[..., :-1] / grid_warped_flat_homo[..., -1:]    # B*N*2
+                    grid_warped = grid_warped_flat.view(batch_size, height, width, 2)   # B*H*W*2
+
+                    height_ori = oris.shape[2]
+                    width_ori = oris.shape[3]
+                    grid_warped[..., 0] = grid_warped[..., 0] / width_ori * 2 - 1
+                    grid_warped[..., 1] = grid_warped[..., 1] / height_ori * 2 - 1
+
+                    feature_warped = torch.nn.functional.grid_sample(oris, grid_warped, mode='bilinear', padding_mode='zeros', align_corners=False)
+
+                    writer_vis.add_images("warped_oris", feature_warped, i)
+                    ##########################################################
+                
+                pred = model(imgs, x_sec_view=oris, H_img_bev=H_img_bev, writer=writer_vis)   ### VISMODE1113
 
             # Loss
-            loss, loss_items = compute_loss(pred, targets, model, half_angle=half_angle)
+            loss, loss_items = compute_loss(pred, targets, model, use_giou_loss=opt.giou_loss, half_angle=half_angle, tail_inv=opt.tail_inv)
             if not torch.isfinite(loss):
                 print('WARNING: non-finite loss, ending training ', loss_items)
                 return results
@@ -373,9 +603,10 @@ def train(hyp):
             else:
                 loss.backward()
 
+            # print("lr_print:", optimizer.param_groups[0]['lr'])
             # Optimize
             if ni % accumulate == 0:
-                optimizer.step()
+                optimizer.step()    # VISMODE1113: comment this line, do not update the weights
                 optimizer.zero_grad()
                 ema.update(model)
 
@@ -383,14 +614,15 @@ def train(hyp):
             mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
             mem = '%.3gG' % (torch.cuda.memory_cached() / 1E9 if torch.cuda.is_available() else 0)  # (GB)
             # s = ('%10s' * 2 + '%10.3g' * 6) % ('%g/%g' % (epoch, epochs - 1), mem, *mloss, len(targets), img_size) # 2 + 4 + 2
-            s = ('%10s' * 2 + '%10.3g' * 9) % ('%g/%g' % (epoch, epochs - 1), mem, *mloss, len(targets), img_size)  # 6 changed to 9 because rbbox produces lxy, lwh, lr # 2 + 7 + 2
+            s = ('%10s' * 2 + '%10.3g' * 10) % ('%g/%g' % (epoch, epochs - 1), mem, *mloss, len(targets), img_size)  # 6 changed to 9 because rbbox produces lxy, lwh, lr, ltt # 2 + 8 + 2
             # mloss=(lbox, lobj, lcls, loss) originally
             # mloss=(lbox, lobj, lcls, lxy, lwh, lr, loss) to be compatible with rbox
+            # mloss=(lbox, lobj, lcls, lxy, lwh, lr, ltt, loss) to be compatible with rbox with tail
             pbar.set_description(s)
 
             # Plot
             if ni < 1:
-                f = 'train_batch%g.jpg' % i  # filename
+                f = rdir+'train_batch%g.jpg' % i  # filename
                 res = plot_images(images=imgs, targets=targets, paths=paths, fname=f)
                 if tb_writer:
                     tb_writer.add_image(f, res, dataformats='HWC', global_step=epoch)
@@ -421,13 +653,19 @@ def train(hyp):
                                       id=epoch, 
                                       rotated_anchor=rotated_anchor, 
                                       half_angle=half_angle, 
-                                      bev_dataset=opt.bev_dataset )
+                                      bev_dataset=opt.bev_dataset,
+                                      tail=opt.tail, 
+                                      tail_inv=opt.tail_inv, 
+                                      dual_view=dual_view, 
+                                      use_mask=use_mask, 
+                                      giou_loss=opt.giou_loss, 
+                                      riou=opt.riou)
 
         # Write
         ### s is from training, as an updated average of the whole epoch
         with open(results_file, 'a') as f:
             # f.write(s + '%10.3g' * 7 % results + '\n')  # P, R, mAP, F1, test_losses=(GIoU, obj, cls)
-            f.write(s + '%10.3g' * 10 % results + '\n')  # P, R, mAP, F1, test_losses=(GIoU, obj, cls, lxy, lwh, lr) to be compatible with rotated case
+            f.write(s + '%10.3g' * 11 % results + '\n')  # P, R, mAP, F1, test_losses=(GIoU, obj, cls, lxy, lwh, lr, ltt) to be compatible with rotated case
         if len(opt.name) and opt.bucket:
             os.system('gsutil cp results.txt gs://%s/results/results%s.txt' % (opt.bucket, opt.name))
 
@@ -436,7 +674,7 @@ def train(hyp):
         if tb_writer:
             tags = ['train/giou_loss', 'train/obj_loss', 'train/cls_loss',
                     'metrics/precision', 'metrics/recall', 'metrics/mAP_0.5', 'metrics/F1',
-                    'val/giou_loss', 'val/obj_loss', 'val/cls_loss']
+                    'val/giou_loss', 'val/obj_loss', 'val/cls_loss']    # tt
             for x, tag in zip(list(mloss[:-1]) + list(results), tags):
                 tb_writer.add_scalar(tag, x, epoch)
 
@@ -453,27 +691,37 @@ def train(hyp):
                          'best_fitness': best_fitness,
                          'training_results': f.read(),
                          'model': ema.ema.module.state_dict() if hasattr(model, 'module') else ema.ema.state_dict(),
-                         'optimizer': None if final_epoch else optimizer.state_dict()}
+                         'optimizer': optimizer.state_dict()
+                         }
+                        #  'optimizer': None if final_epoch else optimizer.state_dict()}   
+                        ## changed 09302020: we need to save the optimizer. https://discuss.pytorch.org/t/a-problem-occured-when-resuming-an-optimizer/28822/5
+                        ## However, since the lr scheduler uses a cosine learning rate decay, 
+                        ## continue training from completely trained weights is not equivalent to traing these later epochs with the previous ones together. 
 
             # Save last, best and delete
             torch.save(chkpt, last)
+            print("Model and optimizer saved to:", last)
             if (best_fitness == fi) and not final_epoch:
                 torch.save(chkpt, best)
             del chkpt
-
+        else:
+            print("Model and optimizer not saved:")
         # end epoch ----------------------------------------------------------------------------------------------------
     # end training
 
     n = opt.name
     if len(n):
         n = '_' + n if not n.isnumeric() else n
-        fresults, flast, fbest = 'results%s.txt' % n, wdir + 'last%s.pt' % n, wdir + 'best%s.pt' % n
-        for f1, f2 in zip([wdir + 'last.pt', wdir + 'best.pt', 'results.txt'], [flast, fbest, fresults]):
+        fresults, flast, fbest = rdir+'results%s.txt' % n, wdir + 'last%s.pt' % n, wdir + 'best%s.pt' % n
+        # for f1, f2 in zip([wdir + 'last.pt', wdir + 'best.pt', 'results.txt'], [flast, fbest, fresults]):
+        for f1, f2 in zip([last, best, results_file], [flast, fbest, fresults]):
             if os.path.exists(f1):
                 os.rename(f1, f2)  # rename
                 ispt = f2.endswith('.pt')  # is *.pt
-                strip_optimizer(f2) if ispt else None  # strip optimizer
+                # strip_optimizer(f2) if ispt else None  # strip optimizer    ### Minghan: if we want to preserve the optimizer states in the checkpoint, comment this line
                 os.system('gsutil cp %s gs://%s/weights' % (f2, opt.bucket)) if opt.bucket and ispt else None  # upload
+
+        print("last.pt, best.pt, results.txt renamed.txt renamed")
 
     if not opt.evolve:
         plot_results()  # save as results.png
@@ -507,6 +755,12 @@ if __name__ == '__main__':
     parser.add_argument('--rotated-anchor', action='store_true', help='use residual yaw w.r.t. anchors instead of regressing the original angle')
     parser.add_argument('--half-angle', action='store_true', help='use 180 degree instead of 360 degree in direction estimation (forward-backward equivalent)')
     parser.add_argument('--bev-dataset', action='store_true', help='use dataset of customized unified structure for bev')
+    parser.add_argument('--tail', action='store_true', help='predict tail along with rbox')
+    parser.add_argument('--tail-inv', action='store_true', help='predict tail along with rbox, with the xy origin at the end of tail')
+    parser.add_argument('--dual-view', action='store_true', help='use both bev and original view as input')
+    parser.add_argument('--use-mask', action='store_true', help='use invalid region mask to mask out some regions (do not want detections there)')
+    parser.add_argument('--giou-loss', action='store_true', help='use giou in loss function')
+    parser.add_argument('--riou', action='store_true', help='use riou threshold in quantitative evaluation')
     
     opt = parser.parse_args()
     opt.weights = last if opt.resume else opt.weights
@@ -521,6 +775,10 @@ if __name__ == '__main__':
 
     # scale hyp['obj'] by img_size (evolved at 320)
     # hyp['obj'] *= opt.img_size[0] / 320.
+
+    ### some hyp should change according to the options
+    set_hyp_by_opt(opt)
+    save_cfg(opt, hyp)
 
     tb_writer = None
     if not opt.evolve:  # Train normally

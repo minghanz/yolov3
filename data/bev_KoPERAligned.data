@@ -1,4 +1,4 @@
 classes=1
-train=data/bev_KoPERAligned_train.txt
-valid=data/bev_KoPERAligned_test.txt
+train=/media/sda1/datasets/extracted/roadmanship_format/shapenet_KoPER1_3D_black_aligned_1/splits/train.txt /media/sda1/datasets/extracted/roadmanship_format/shapenet_KoPER1_3D_black_aligned_2/splits/train.txt /media/sda1/datasets/extracted/roadmanship_format/shapenet_KoPER4_3D_black_aligned_1/splits/train.txt /media/sda1/datasets/extracted/roadmanship_format/shapenet_KoPER4_3D_black_aligned_2/splits/train.txt 
+valid=/media/sda1/datasets/extracted/roadmanship_format/shapenet_KoPER1_3D_black_aligned_1/splits/test.txt /media/sda1/datasets/extracted/roadmanship_format/shapenet_KoPER1_3D_black_aligned_2/splits/test.txt /media/sda1/datasets/extracted/roadmanship_format/shapenet_KoPER4_3D_black_aligned_1/splits/test.txt /media/sda1/datasets/extracted/roadmanship_format/shapenet_KoPER4_3D_black_aligned_2/splits/test.txt
 names=data/bev_network.names

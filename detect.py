@@ -5,6 +5,7 @@ from utils.datasets import *
 from utils.utils import *
 from coco_cvt import cvt2coco
 
+from tqdm import tqdm
 
 def detect(save_img=False):
     imgsz = (320, 192) if ONNX_EXPORT else opt.img_size  # (320, 192) or (416, 256) or (608, 352) for (height, width)
@@ -15,15 +16,19 @@ def detect(save_img=False):
     rotated_anchor = opt.rotated_anchor
     single_cls = opt.single_cls
     half_angle = opt.half_angle
+    tail = opt.tail
+    tail_inv = opt.tail_inv
+    dual_view = opt.dual_view
+    use_mask = opt.use_mask
 
     # Initialize
     device = torch_utils.select_device(device='cpu' if ONNX_EXPORT else opt.device)
-    if os.path.exists(out):
-        shutil.rmtree(out)  # delete output folder
-    os.makedirs(out)  # make new output folder
+    # if os.path.exists(out):
+    #     shutil.rmtree(out)  # delete output folder
+    os.makedirs(out, exist_ok=True)  # make new output folder
 
     # Initialize model
-    model = Darknet(opt.cfg, imgsz, rotated=rotated, half_angle=half_angle)
+    model = Darknet(opt.cfg, imgsz, rotated=rotated, half_angle=half_angle, tail=tail, tail_inv=tail_inv, rotated_anchor=rotated_anchor, dual_view=dual_view)
 
     # Load weights
     attempt_download(weights)
@@ -73,7 +78,12 @@ def detect(save_img=False):
         dataset = LoadStreams(source, img_size=imgsz)
     else:
         save_img = True
-        dataset = LoadImages(source, img_size=imgsz)
+        if not dual_view:
+            dataset = LoadImages(source, img_size=imgsz, use_mask=use_mask)
+        else:
+            dataset_bev = LoadImages(source, img_size=imgsz, dual_view_first=True, use_mask=use_mask)
+            dataset_ori = LoadImages(source, img_size=imgsz, dual_view_second=True, use_mask=use_mask)
+            dataset = LoadImagesDual(dataset_bev, dataset_ori)
 
     # Get names and colors
     names = load_classes(opt.names)
@@ -86,18 +96,51 @@ def detect(save_img=False):
     # Run inference
     t0 = time.time()
     img = torch.zeros((1, 3, imgsz, imgsz), device=device)  # init img
-    _ = model(img.half() if half else img.float()) if device.type != 'cpu' else None  # run once
-    for frame_i, (path, img, im0s, vid_cap) in enumerate(dataset):
+    if not dual_view:
+        _ = model(img.half() if half else img.float()) if device.type != 'cpu' else None  # run once
+    else:
+        H_img_bev = torch.zeros((1, 3, 3, 3), device=device)
+        _ = model(img.half() if half else img.float(), x_sec_view=img.half() if half else img.float(), H_img_bev=H_img_bev.half() if half else H_img_bev.float()) if device.type != 'cpu' else None  # run once
+
+    pbar = tqdm(dataset, total=dataset.nframes) # note that nframes is defined only when the source is video
+    for frame_i, sample_batch in enumerate(pbar):
     # for path, img, im0s, vid_cap in dataset:
+        # if frame_i > 3600:
+        #     break
+        
+        if dual_view:
+            path, img, im0s, invalid_mask, vid_cap, H_img_bev, img_ori = sample_batch
+
+            img_ori = torch.from_numpy(img_ori).to(device)
+            img_ori = img_ori.half() if half else img_ori.float()  # uint8 to fp16/32
+            img_ori /= 255.0  # 0 - 255 to 0.0 - 1.0
+            if img_ori.ndimension() == 3:
+                img_ori = img_ori.unsqueeze(0)
+
+            H_img_bev = H_img_bev.to(device).float()    # H_img_bev is a torch.Tensor from dataset
+            if H_img_bev.ndimension() == 3:
+                H_img_bev = H_img_bev.unsqueeze(0)
+        else:
+            path, img, im0s, invalid_mask, vid_cap = sample_batch
+
         img = torch.from_numpy(img).to(device)
         img = img.half() if half else img.float()  # uint8 to fp16/32
         img /= 255.0  # 0 - 255 to 0.0 - 1.0
         if img.ndimension() == 3:
             img = img.unsqueeze(0)
 
+        if invalid_mask is not None:
+            invalid_mask = torch.from_numpy(invalid_mask).to(device)
+            invalid_mask = invalid_mask.half() if half else invalid_mask.float()  # uint8 to fp16/32
+            invalid_mask /= 255.0  # 0 - 255 to 0.0 - 1.0
+        invalid_mask = [invalid_mask]
+
         # Inference
         t1 = torch_utils.time_synchronized()
-        pred = model(img, augment=opt.augment)[0]
+        if not dual_view:
+            pred = model(img, augment=opt.augment)[0]
+        else:
+            pred = model(img, augment=opt.augment, x_sec_view=img_ori, H_img_bev=H_img_bev)[0]  # inference and training outputs
         t2 = torch_utils.time_synchronized()
 
         # to float
@@ -106,14 +149,14 @@ def detect(save_img=False):
 
         # Apply NMS
         pred = non_max_suppression(pred, opt.conf_thres, opt.iou_thres,
-                                   multi_label=False, classes=opt.classes, agnostic=opt.agnostic_nms, rotated=rotated, rotated_anchor=rotated_anchor)
+                                   multi_label=False, classes=opt.classes, agnostic=opt.agnostic_nms, rotated=rotated, rotated_anchor=rotated_anchor, tail=tail, invalid_masks=invalid_mask)
 
         # Apply Classifier
         if classify:
             pred = apply_classifier(pred, modelc, img, im0s)
 
         # Process detections
-        for i, det in enumerate(pred):  # detections for image i
+        for i, det_raw in enumerate(pred):  # detections for image i
             if webcam:  # batch_size >= 1
                 p, s, im0 = path[i], '%g: ' % i, im0s[i]
             else:
@@ -122,7 +165,10 @@ def detect(save_img=False):
             save_path = str(Path(out) / Path(p).name)
             s += '%gx%g ' % img.shape[2:]  # print string
             gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]  #  normalization gain whwh
-            if det is not None and len(det):
+            if det_raw is not None and len(det_raw):
+                ### preserve both det and det_raw, because H_img_bev converts between det_raw and img_ori
+                det = det_raw.clone()
+
                 # Rescale boxes from imgsz to im0 size
                 det[:, :4] = scale_coords(img.shape[2:], det[:, :4], im0.shape).round()
 
@@ -149,11 +195,15 @@ def detect(save_img=False):
                                 file.write(('%g ' * 7 + '\n') % (frame_i, *xyxy, cls, conf))  # label format with conf, write xyxy
                         else:
                             xyxy_np = torch.tensor(xyxy).numpy()[None]
-                            xyxy_8 = xywh2xyxy_r(xyxy_np)[0]
+                            xywhr_np = xyxy_np[:,:5]
+                            xyxy_8 = xywh2xyxy_r(xywhr_np)[0]
                             with open(save_path[:save_path.rfind('.')] + '.txt', 'a') as file:
-                                # file.write(('%g ' * 6 + '\n') % (cls, *xyxy))  # actually xyxy are xywhr
-                                file.write(('%g ' * 8 + '\n') % (frame_i, *xyxy, cls, conf))  # frame_number, xywhr, class, confidence
-                                # file.write(('%g ' * 10 + '\n') % (frame_i, cls, *xyxy_8))  # save point coordinate for easier visualization later
+                                if not tail:
+                                    # file.write(('%g ' * 6 + '\n') % (cls, *xyxy))  # actually xyxy are xywhr
+                                    file.write(('%g ' * 8 + '\n') % (frame_i, *xyxy, cls, conf))  # frame_number, xywhr, class, confidence
+                                    # file.write(('%g ' * 10 + '\n') % (frame_i, cls, *xyxy_8))  # save point coordinate for easier visualization later
+                                else:
+                                    file.write(('%g ' * 10 + '\n') % (frame_i, *xyxy, cls, conf))  # frame_number, xywhr, tail_x, tail_y, class, confidence
 
                     if save_img or view_img:  # Add bbox to image
                         if not rotated:
@@ -168,10 +218,15 @@ def detect(save_img=False):
                             else:
                                 label = '%.1f' % conf
                             # label = None
-                            plot_one_box(xyxy_8, im0, label=label, color=colors[int(cls)])
+                            if tail:
+                                plot_one_box(np.array([ *xyxy_8, xyxy_np[0,5], xyxy_np[0,6] ]), im0, label=label, color=colors[int(cls)])
+                            else:
+                                plot_one_box(xyxy_8, im0, label=label, color=colors[int(cls)])
 
             # Print time (inference + NMS)
-            print('%sDone. (%.3fs)' % (s, t2 - t1))
+            # print('%sDone. (%.3fs)' % (s, t2 - t1))
+            pbar.set_description('%sDone. (%.3fs)' % (s, t2 - t1))
+            # pbar.update()
 
             # Stream results
             if view_img:
@@ -226,6 +281,10 @@ if __name__ == '__main__':
     parser.add_argument('--rotated', action='store_true', help='use rotated bbox instead of axis-aligned ones')
     parser.add_argument('--rotated-anchor', action='store_true', help='use residual yaw w.r.t. anchors instead of regressing the original angle')
     parser.add_argument('--half-angle', action='store_true', help='use 180 degree instead of 360 degree in direction estimation (forward-backward equivalent)')
+    parser.add_argument('--tail', action='store_true', help='predict tail along with rbox')
+    parser.add_argument('--tail-inv', action='store_true', help='predict tail along with rbox, with the xy origin at the end of tail')
+    parser.add_argument('--dual-view', action='store_true', help='use both bev and original view as input')
+    parser.add_argument('--use-mask', action='store_true', help='use invalid region mask to mask out some regions (do not want detections there)')
     opt = parser.parse_args()
     opt.cfg = list(glob.iglob('./**/' + opt.cfg, recursive=True))[0]  # find file
     opt.names = list(glob.iglob('./**/' + opt.names, recursive=True))[0]  # find file

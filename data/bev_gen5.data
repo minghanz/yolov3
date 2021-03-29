@@ -1,4 +1,0 @@
-classes=1
-train=data/bev_gen_train5.txt
-valid=data/bev_gen_test5.txt
-names=data/bev_network.names

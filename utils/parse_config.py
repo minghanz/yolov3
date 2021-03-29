@@ -86,15 +86,17 @@ def parse_data_yaml(path):
     for key, value in options_raw.items():
         if key not in ["train", "valid"]:
             options[key] = value
-    options["train"] = []
-    options["valid"] = []
 
-    for key, value in options_raw["train"].items():
-        path_cur = os.path.join(options["root"], key, "splits", value+".txt")
-        options["train"].append(path_cur)
+    if "train" in options_raw:
+        options["train"] = []
+        for key, value in options_raw["train"].items():
+            path_cur = os.path.join(options["root"], key, "splits", value+".txt")
+            options["train"].append(path_cur)
 
-    for key, value in options_raw["valid"].items():
-        path_cur = os.path.join(options["root"], key, "splits", value+".txt")
-        options["valid"].append(path_cur)
+    if "valid" in options_raw:
+        options["valid"] = []
+        for key, value in options_raw["valid"].items():
+            path_cur = os.path.join(options["root"], key, "splits", value+".txt")
+            options["valid"].append(path_cur)
 
     return options

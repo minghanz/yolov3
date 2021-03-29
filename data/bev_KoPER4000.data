@@ -1,4 +1,0 @@
-classes=1
-train=data/bev_KoPER_train4000.txt
-valid=data/bev_KoPER_test4000.txt
-names=data/bev_network.names

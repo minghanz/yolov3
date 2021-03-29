@@ -26,13 +26,85 @@ class Concat(nn.Module):
 
 
 class FeatureConcat(nn.Module):
-    def __init__(self, layers):
+    def __init__(self, layers, dual_view=False):
         super(FeatureConcat, self).__init__()
         self.layers = layers  # layer indices
         self.multiple = len(layers) > 1  # multiple layers flag
+        self.dual_view = dual_view
 
-    def forward(self, x, outputs):
-        return torch.cat([outputs[i] for i in self.layers], 1) if self.multiple else outputs[self.layers[0]]
+        self.layers_to_warp = [i for i in self.layers if i > 0] if self.dual_view else []
+        assert len(self.layers_to_warp) in [0,1]
+
+        self.inner_count = 0
+
+    def forward(self, x, outputs, outputs_sub=[], H_img_bev=None, writer=None): # VISMODE1113
+        ### outputs_sub is given when we are using both bev and original view. 
+        ### Need to concat features from both views at layers that are dual_view_accept_layers (self.dual_view==True)
+        if len(outputs_sub) == 0 or not self.dual_view:
+            return torch.cat([outputs[i] for i in self.layers], 1) if self.multiple else outputs[self.layers[0]]
+        else:
+            assert len(self.layers_to_warp) == 1
+            layer_warp = self.layers_to_warp[0]
+            assert layer_warp in [36, 61], layer_warp   # for yolov3-spp
+            grid_shape = outputs[layer_warp].shape
+            height = grid_shape[2]
+            width = grid_shape[3]
+            batch_size = grid_shape[0]
+            # xs = torch.linspace(-1, 1, width)   # if align_corners==True, the corner pixel center is -1 / 1
+            # ys = torch.linspace(-1, 1, height)  # if align_corners==False, the corner of corner pixels is -1 / 1, thererfore the corner pixel center is not -1 / 1
+            xs = torch.arange(width) + 0.5
+            ys = torch.arange(height) + 0.5
+            # xs = (torch.arange(width) + 0.5) / width * 2 - 1
+            # ys = (torch.arange(height) + 0.5) / height * 2 - 1
+            
+            base_grid = torch.stack(
+                torch.meshgrid([xs, ys])).transpose(1, 2).to(device=outputs[layer_warp].device, dtype=outputs[layer_warp].dtype)  # 2xHxW
+            base_grid = torch.unsqueeze(base_grid, dim=0).permute(0, 2, 3, 1).expand(batch_size, -1, -1, -1)  # BxHxWx2
+            grid_flat = base_grid.reshape(batch_size, -1, 2)    # B*N*2
+            grid_flat_homo = torch.nn.functional.pad(grid_flat, (0, 1), "constant", 1.0)    # B*N*3
+
+            H_to_use = H_img_bev[:, 1] if layer_warp == 36 else H_img_bev[:, 2] # B*3*3
+
+            grid_warped_flat_homo = torch.matmul(
+                H_to_use.unsqueeze(1), grid_flat_homo.unsqueeze(-1))    # B*1*3*3 x B*N*3*1 => B*N*3*1
+            grid_warped_flat_homo = torch.squeeze(grid_warped_flat_homo, dim=-1)    # B*N*3
+
+            grid_warped_flat = grid_warped_flat_homo[..., :-1] / grid_warped_flat_homo[..., -1:]    # B*N*2
+            grid_warped = grid_warped_flat.view(batch_size, height, width, 2)   # B*H*W*2
+
+            height_ori = outputs_sub[layer_warp].shape[2]
+            width_ori = outputs_sub[layer_warp].shape[3]
+            grid_warped[..., 0] = grid_warped[..., 0] / width_ori * 2 - 1
+            grid_warped[..., 1] = grid_warped[..., 1] / height_ori * 2 - 1
+
+            feature_warped = torch.nn.functional.grid_sample(outputs_sub[layer_warp], grid_warped, mode='bilinear', padding_mode='zeros', align_corners=False)
+
+            if writer is not None: # VISMODE1113
+                print("intm feature shape ori",layer_warp, outputs_sub[layer_warp].shape)
+                # writer.add_images("feat_ori_%d"%layer_warp, outputs_sub[layer_warp][:,:3], self.inner_count)
+                # writer.add_images("feat_warped_ori_%d"%layer_warp, feature_warped[:,:3], self.inner_count)
+                for ii in range(batch_size):
+                    writer.add_image("feat_ori_%d/%d"%(layer_warp, ii), outputs_sub[layer_warp][ii,:3], self.inner_count)
+                    writer.add_image("feat_warped_ori_%d/%d"%(layer_warp, ii), feature_warped[ii,:3], self.inner_count)
+                for layer_i in self.layers:
+                    print("intm feature shape bev ",layer_i, outputs_sub[layer_i].shape)
+                    # writer.add_images("feat_bev_%d_%d"%(layer_warp, layer_i), outputs[layer_i][:,:3], self.inner_count)
+                    for ii in range(batch_size):
+                        writer.add_image("feat_bev_%d_%d/%d"%(layer_warp, layer_i, ii), outputs[layer_i][ii,:3], self.inner_count)
+                self.inner_count = self.inner_count + 1
+
+            if self.multiple:
+                return torch.cat([outputs[i] for i in self.layers] + [feature_warped], 1) # i > 0 means it is absolute (positive) index. outputs_sub only accept absolute index. 
+            else:
+                assert self.layers[0] > 0   # i > 0 means it is absolute (positive) index. outputs_sub only accept absolute index. 
+                return torch.cat([outputs[self.layers[0]], feature_warped] , 1)
+
+            # if self.multiple:
+
+            #     return torch.cat([outputs[i] for i in self.layers] + [outputs_sub[i] for i in self.layers if i > 0], 1) # i > 0 means it is absolute (positive) index. outputs_sub only accept absolute index. 
+            # else:
+            #     assert self.layers[0] > 0   # i > 0 means it is absolute (positive) index. outputs_sub only accept absolute index. 
+            #     return torch.cat([outputs_[self.layers[0]] for outputs_ in [outputs, outputs_sub]], 1)
 
 
 class WeightedFeatureFusion(nn.Module):  # weighted sum of 2 or more layers https://arxiv.org/abs/1911.09070
@@ -59,10 +131,16 @@ class WeightedFeatureFusion(nn.Module):  # weighted sum of 2 or more layers http
             # Adjust channels
             if nx == na:  # same shape
                 x = x + a
+                # # VISMODE1113 divide by 2
+                # x = x / 2
             elif nx > na:  # slice input
                 x[:, :na] = x[:, :na] + a  # or a = nn.ZeroPad2d((0, 0, 0, 0, 0, dc))(a); x = x + a
+                # # VISMODE1113 divide by 2
+                # x[:, :na] = x[:, :na] / 2
             else:  # slice feature
                 x = x + a[:, :nx]
+                # # VISMODE1113 divide by 2
+                # x = x / 2
 
         return x
 

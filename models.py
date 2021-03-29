@@ -5,22 +5,42 @@ from utils.parse_config import *
 from utils.utils import yaw2v, v2yaw
 
 import torchsnooper
+from torch.utils.tensorboard import SummaryWriter #VISMODE1113
 
 ONNX_EXPORT = False
 
 
-def create_modules(module_defs, img_size, cfg, rotated=False, half_angle=False):
+def create_modules(module_defs, img_size, cfg, rotated=False, half_angle=False, tail=False, tail_inv=False, rotated_anchor=True, dual_view_first=False, dual_view_second=False):
     # Constructs module list of layer blocks from module configuration in module_defs
 
     img_size = [img_size] * 2 if isinstance(img_size, int) else img_size  # expand if necessary
-    _ = module_defs.pop(0)  # cfg training hyperparams (unused)
+
+    ### pop the first only if the first is configuration. 
+    if module_defs[0]['type'] == 'net':
+        _ = module_defs.pop(0)  # cfg training hyperparams (unused)
+
     output_filters = [3]  # input channels
     module_list = nn.ModuleList()
     routs = []  # list of layers which rout to deeper layers
     yolo_index = -1
 
+    ### alter the number of channels at specific layers to accomodate to dual_view
+    dual_view_out_layer_idx = []
+    dual_view_out_next_layer_idx = []
+    if dual_view_first:
+        dual_view_out_layer_idx = [36, 61]
+        dual_view_out_next_layer_idx = [dual_view_out_layer_idx[i] + 1 for i in range(len(dual_view_out_layer_idx)-1) ]   # all the layers after dual_view_out_layer except the last one. They should recover the original input channels
+
     for i, mdef in enumerate(module_defs):
         modules = nn.Sequential()
+        ### for dual_view_out_layer
+        dual_view_out_layer_flag = i in dual_view_out_layer_idx
+        dual_view_out_next_layer_flag = i in dual_view_out_next_layer_idx
+        output_filters_last = output_filters[-1]
+        if dual_view_out_next_layer_flag:
+            output_filters_last = output_filters[-1] / 2
+            assert round(output_filters_last) == output_filters_last
+            output_filters_last = int(round(output_filters_last))
 
         if mdef['type'] == 'convolutional':
             bn = mdef['batch_normalize']
@@ -28,7 +48,7 @@ def create_modules(module_defs, img_size, cfg, rotated=False, half_angle=False):
             k = mdef['size']  # kernel size
             stride = mdef['stride'] if 'stride' in mdef else (mdef['stride_y'], mdef['stride_x'])
             if isinstance(k, int):  # single-size conv
-                modules.add_module('Conv2d', nn.Conv2d(in_channels=output_filters[-1],
+                modules.add_module('Conv2d', nn.Conv2d(in_channels=output_filters_last,
                                                        out_channels=filters,
                                                        kernel_size=k,
                                                        stride=stride,
@@ -36,7 +56,7 @@ def create_modules(module_defs, img_size, cfg, rotated=False, half_angle=False):
                                                        groups=mdef['groups'] if 'groups' in mdef else 1,
                                                        bias=not bn))
             else:  # multiple-size conv
-                modules.add_module('MixConv2d', MixConv2d(in_ch=output_filters[-1],
+                modules.add_module('MixConv2d', MixConv2d(in_ch=output_filters_last,
                                                           out_ch=filters,
                                                           k=k,
                                                           stride=stride,
@@ -44,6 +64,7 @@ def create_modules(module_defs, img_size, cfg, rotated=False, half_angle=False):
 
             if bn:
                 modules.add_module('BatchNorm2d', nn.BatchNorm2d(filters, momentum=0.03, eps=1E-4))
+                # pass # VISMODE1113 in this mode, do not add batchnorm layer
             else:
                 routs.append(i)  # detection output (goes into yolo layer)
 
@@ -55,7 +76,7 @@ def create_modules(module_defs, img_size, cfg, rotated=False, half_angle=False):
                 modules.add_module('activation', Mish())
 
         elif mdef['type'] == 'BatchNorm2d':
-            filters = output_filters[-1]
+            filters = output_filters_last
             modules = nn.BatchNorm2d(filters, momentum=0.03, eps=1E-4)
             if i == 0 and filters == 3:  # normalize RGB image
                 # imagenet mean and var https://pytorch.org/docs/stable/torchvision/models.html#classification
@@ -83,11 +104,13 @@ def create_modules(module_defs, img_size, cfg, rotated=False, half_angle=False):
             layers = mdef['layers']
             filters = sum([output_filters[l + 1 if l > 0 else l] for l in layers])
             routs.extend([i + l if l < 0 else l for l in layers])
-            modules = FeatureConcat(layers=layers)
+
+            dual_view_in_layer_flag = any(idx in layers for idx in dual_view_out_layer_idx)
+            modules = FeatureConcat(layers=layers, dual_view=dual_view_in_layer_flag)
 
         elif mdef['type'] == 'shortcut':  # nn.Sequential() placeholder for 'shortcut' layer
             layers = mdef['from']
-            filters = output_filters[-1]
+            filters = output_filters_last
             routs.extend([i + l if l < 0 else l for l in layers])
             modules = WeightedFeatureFusion(layers=layers, weight='weights_type' in mdef)
 
@@ -109,25 +132,50 @@ def create_modules(module_defs, img_size, cfg, rotated=False, half_angle=False):
                                 layers=layers,  # output layers
                                 stride=stride[yolo_index], 
                                 rotated=rotated, 
-                                half_angle=half_angle) ### check rotated flag
+                                half_angle=half_angle, 
+                                tail=tail, 
+                                tail_inv=tail_inv, 
+                                rotated_anchor=rotated_anchor) ### check rotated flag
 
             # Initialize preceding Conv2d() bias (https://arxiv.org/pdf/1708.02002.pdf section 3.3)
             try:
                 j = layers[yolo_index] if 'from' in mdef else -1
                 bias_ = module_list[j][0].bias  # shape(255,)
                 bias = bias_[:modules.no * modules.na].view(modules.na, -1)  # shape(3,85)
-                bias[:, 4] += -4.5  # obj
-                bias[:, 5:] += math.log(0.6 / (modules.nc - 0.99))  # cls (sigmoid(p) = 1/nc)
+                if rotated:
+                    if rotated_anchor:
+                        if tail:
+                            idx_obj = 7
+                        else:
+                            idx_obj = 5
+                    else:
+                        if tail:
+                            idx_obj = 8
+                        else:
+                            idx_obj = 6
+                else:
+                    idx_obj = 4
+                bias[:, idx_obj] += -4.5  # obj
+                bias[:, idx_obj+1:] += math.log(0.6 / (modules.nc - 0.99))  # cls (sigmoid(p) = 1/nc)
                 module_list[j][0].bias = torch.nn.Parameter(bias_, requires_grad=bias_.requires_grad)
+                print("Initialize preceding Conv2d() bias (https://arxiv.org/pdf/1708.02002.pdf section 3.3)")
             except:
                 print('WARNING: smart bias initialization failure.')
 
         else:
             print('Warning: Unrecognized Layer Type: ' + mdef['type'])
 
+        if dual_view_out_layer_flag:
+            filters = filters * 2
+
         # Register module list and number of output filters
         module_list.append(modules)
         output_filters.append(filters)
+
+        ### if we use both bev and original view for feature extraction, we do not need to construct a full copy of the network for original view. 
+        ### Just till the second skip connection layer, which is at layer 61 for yolov3-spp
+        if dual_view_second and i == 61:
+            break
 
     routs_binary = [False] * (i + 1)
     for i in routs:
@@ -136,7 +184,7 @@ def create_modules(module_defs, img_size, cfg, rotated=False, half_angle=False):
 
 
 class YOLOLayer(nn.Module):
-    def __init__(self, anchors, nc, img_size, yolo_index, layers, stride, rotated, half_angle):
+    def __init__(self, anchors, nc, img_size, yolo_index, layers, stride, rotated, half_angle, tail, tail_inv, rotated_anchor):
         super(YOLOLayer, self).__init__()
         self.anchors = torch.Tensor(anchors)
         self.index = yolo_index  # index of this layer in layers
@@ -147,12 +195,14 @@ class YOLOLayer(nn.Module):
         self.nc = nc  # number of classes (80)
         self.rotated = rotated
         self.half_angle = half_angle
+        self.tail=tail
+        self.tail_inv = tail_inv
         self.anchor_vec = self.anchors / self.stride
         if self.rotated:
             assert self.anchor_vec.shape[1] == 3
             self.anchor_vec[:, 2] = self.anchors[:, 2]
             self.anchor_wh = self.anchor_vec.view(1, self.na, 1, 1, 3)
-            self.rotated_anchor = True
+            self.rotated_anchor = rotated_anchor
         else:
             assert self.anchor_vec.shape[1] == 2
             self.anchor_wh = self.anchor_vec.view(1, self.na, 1, 1, 2)
@@ -162,6 +212,8 @@ class YOLOLayer(nn.Module):
                 self.no = nc + 6 # original 5, 1 added to express residual rotation angle w.r.t. anchor. xywhrp
             else:
                 self.no = nc + 7 # original 5, 2 added to express rotation angle. The 5 are xywhvvp
+            if self.tail:
+                self.no += 2    # for dxdy
         else:
             self.no = nc + 5 # number of outputs (85)
         self.nx, self.ny, self.ng = 0, 0, 0  # initialize number of x, y gridpoints
@@ -249,20 +301,43 @@ class YOLOLayer(nn.Module):
                     yaw = v2yaw(v_normalized)
                     ### when yaw=0, vec=[0,1], positive dir is [sin(theta), cos(theta)], counter clockwise, consistent with rotation in augmentation in random_affine_xywhr() in datasets.py.
 
-                    p_cls = torch.sigmoid(p[:, 6:7]) if self.nc == 1 else \
-                        torch.sigmoid(p[:, 7:self.no]) * torch.sigmoid(p[:, 6:7])  # conf
+                    if self.tail:
+                        if self.tail_inv:
+                            p_tt = ((p[:, 6:8]/10).sigmoid()-0.5)*20 * anchor_wh[:, [1]]  # dx, dy
+                            xy = xy - p_tt / ng     ### tail_inv
+                        else:
+                            p_tt = p[:, 6:8] * anchor_wh[:, [1]]  # dx, dy
+                        p_cls = torch.sigmoid(p[:, 8:9]) if self.nc == 1 else \
+                            torch.sigmoid(p[:, 9:self.no]) * torch.sigmoid(p[:, 8:9])  # conf
+                    else:
+                        p_cls = torch.sigmoid(p[:, 6:7]) if self.nc == 1 else \
+                            torch.sigmoid(p[:, 7:self.no]) * torch.sigmoid(p[:, 6:7])  # conf
                 else:
                     if self.half_angle:
                         yaw = (torch.sigmoid(p[:, 4])-0.5) * math.pi * 0.5 + anchor_wh[:, 2]
                     else:
                         yaw = (torch.sigmoid(p[:, 4])-0.5) * math.pi + anchor_wh[:, 2]
 
-                    p_cls = torch.sigmoid(p[:, 5:6]) if self.nc == 1 else \
-                        torch.sigmoid(p[:, 6:self.no]) * torch.sigmoid(p[:, 5:6])  # conf
+                    if self.tail:
+                        if self.tail_inv:
+                            p_tt = ((p[:, 5:7]/10).sigmoid()-0.5)*20 * anchor_wh[:, [1]]  # dx, dy
+                            xy = xy - p_tt / ng     ### tail_inv
+                        else:
+                            p_tt = p[:, 5:7] * anchor_wh[:, [1]]  # dx, dy
 
-                return p_cls, xy * ng, wh, yaw
+                        p_cls = torch.sigmoid(p[:, 7:8]) if self.nc == 1 else \
+                            torch.sigmoid(p[:, 8:self.no]) * torch.sigmoid(p[:, 7:8])  # conf
+                    else:
+                        p_cls = torch.sigmoid(p[:, 5:6]) if self.nc == 1 else \
+                            torch.sigmoid(p[:, 6:self.no]) * torch.sigmoid(p[:, 5:6])  # conf
+
+                if self.tail:
+                    return p_cls, xy * ng, wh, yaw, p_tt
+                else:
+                    return p_cls, xy * ng, wh, yaw
 
         else:  # inference
+            ### The inference output is in raw pixels (of input, unnormalized by self.stride and self.anchor_wh, directly usable)
             io = p.clone()  # inference output
             io[..., :2] = torch.sigmoid(io[..., :2]) + self.grid  # xy
             # io[..., 2:4] = torch.exp(io[..., 2:4]) * self.anchor_wh[..., :2]  # wh yolo method
@@ -277,13 +352,29 @@ class YOLOLayer(nn.Module):
                     #     io_need_flip = io[need_flip_idx]
                     #     io_need_flip[:, 4:6] *= -1
                     #     io[need_flip_idx] = io_need_flip
-                    torch.sigmoid_(io[..., 6:])
+                    if self.tail:
+                        if self.tail_inv:
+                            io[..., 6:8] = ((io[..., 6:8]/10).sigmoid()-0.5)*20 * self.anchor_wh[..., [1]] * self.stride
+                            io[..., :2] = io[..., :2] - io[..., 6:8]    ### tail_inv
+                        else:
+                            io[..., 6:8] = io[..., 6:8] * self.anchor_wh[..., [1]] * self.stride
+                        torch.sigmoid_(io[..., 8:])
+                    else:
+                        torch.sigmoid_(io[..., 6:])
                 else:
                     if self.half_angle:
                         io[..., 4] = (torch.sigmoid(io[..., 4])-0.5) * math.pi * 0.5 + self.anchor_wh[..., 2]
                     else:
                         io[..., 4] = (torch.sigmoid(io[..., 4])-0.5) * math.pi + self.anchor_wh[..., 2]
-                    torch.sigmoid_(io[..., 5:])
+                    if self.tail:
+                        if self.tail_inv:
+                            io[..., 5:7] = ((io[..., 5:7]/10).sigmoid()-0.5)*20 * self.anchor_wh[..., [1]] * self.stride
+                            io[..., :2] = io[..., :2] - io[..., 5:7]    ### tail_inv
+                        else:
+                            io[..., 5:7] = io[..., 5:7] * self.anchor_wh[..., [1]] * self.stride
+                        torch.sigmoid_(io[..., 7:])
+                    else:
+                        torch.sigmoid_(io[..., 5:])
             else:
                 torch.sigmoid_(io[..., 4:])
             
@@ -313,11 +404,15 @@ class YOLOLayer(nn.Module):
 class Darknet(nn.Module):
     # YOLOv3 object detection model
 
-    def __init__(self, cfg, img_size=(416, 416), verbose=False, rotated=False, half_angle=False):
+    def __init__(self, cfg, img_size=(416, 416), verbose=False, rotated=False, half_angle=False, tail=False, tail_inv=False, rotated_anchor=True, dual_view=False):
         super(Darknet, self).__init__()
 
         self.module_defs = parse_model_cfg(cfg)
-        self.module_list, self.routs = create_modules(self.module_defs, img_size, cfg, rotated=rotated, half_angle=half_angle)
+        if dual_view:
+            self.module_list, self.routs = create_modules(self.module_defs, img_size, cfg, rotated=rotated, half_angle=half_angle, tail=tail, tail_inv=tail_inv, rotated_anchor=rotated_anchor, dual_view_first=True)
+            self.module_list_sub, self.routs_sub = create_modules(self.module_defs, img_size, cfg, rotated=rotated, half_angle=half_angle, tail=tail, tail_inv=tail_inv, rotated_anchor=rotated_anchor, dual_view_second=True)
+        else:
+            self.module_list, self.routs = create_modules(self.module_defs, img_size, cfg, rotated=rotated, half_angle=half_angle, tail=tail, tail_inv=tail_inv, rotated_anchor=rotated_anchor)
         self.yolo_layers = get_yolo_layers(self)
         # torch_utils.initialize_weights(self)
 
@@ -328,12 +423,15 @@ class Darknet(nn.Module):
 
         self.rotated = rotated
         self.half_angle = half_angle
+        self.tail = tail
+        self.rotated_anchor = rotated_anchor
+        self.dual_view = dual_view
         ### setting rotated only affects when using augmentation in inference. 
 
-    def forward(self, x, augment=False, verbose=False):
+    def forward(self, x, augment=False, verbose=False, x_sec_view=None, H_img_bev=None, writer=None):        # VISMODE1113
 
         if not augment:
-            return self.forward_once(x)
+            return self.forward_once(x, x_sec_view=x_sec_view, H_img_bev=H_img_bev, writer=writer)       # VISMODE1113
         else:  # Augment images (inference and test only) https://github.com/ultralytics/yolov3/issues/931
             img_size = x.shape[-2:]  # height, width
             s = [0.83, 0.67]  # scales
@@ -351,7 +449,21 @@ class Darknet(nn.Module):
             if self.rotated:
             # if y[1].shape[-1] == 87: ### check rotated flag
                 y[1][..., 4] = - y[1][..., 4]
+                if self.tail:
+                    if self.rotated_anchor:
+                        y[1][..., 5:7] /= s[0]
+                        y[1][..., 5] = - y[1][..., 5]
+                    else:
+                        y[1][..., 6:8] /= s[0]
+                        y[1][..., 6] = - y[1][..., 6]
+
             y[2][..., :4] /= s[1]  # scale
+            if self.tail:
+                if self.rotated_anchor:
+                    y[2][..., 5:7] /= s[1]
+                else:
+                    y[2][..., 6:8] /= s[1]
+
 
             # for i, yi in enumerate(y):  # coco small, medium, large = < 32**2 < 96**2 <
             #     area = yi[..., 2:4].prod(2)[:, :, None]
@@ -365,7 +477,7 @@ class Darknet(nn.Module):
             return y, None
 
     # @torchsnooper.snoop()
-    def forward_once(self, x, augment=False, verbose=False):
+    def forward_once(self, x, augment=False, verbose=False, x_sec_view=None, H_img_bev=None, writer=None):      # VISMODE1113
         img_size = x.shape[-2:]  # height, width
         yolo_out, out = [], []
         if verbose:
@@ -380,6 +492,29 @@ class Darknet(nn.Module):
                            torch_utils.scale_img(x.flip(3), s[0]),  # flip-lr and scale
                            torch_utils.scale_img(x, s[1]),  # scale
                            ), 0)
+        
+        ### process the subnetwork
+        out_sec_view = []
+        yolo_out_sec_view = []
+        if self.dual_view:
+            for i, module in enumerate(self.module_list_sub):
+                name = module.__class__.__name__
+                if name in ['WeightedFeatureFusion', 'FeatureConcat']:  # sum, concat
+                    if verbose:
+                        l = [i - 1] + module.layers  # layers
+                        sh = [list(x_sec_view.shape)] + [list(out_sec_view[i].shape) for i in module.layers]  # shapes
+                        str = ' >> ' + ' + '.join(['layer %g %s' % x for x in zip(l, sh)])
+                    x_sec_view = module(x_sec_view, out_sec_view)  # WeightedFeatureFusion(), FeatureConcat()
+                elif name == 'YOLOLayer':
+                    yolo_out_sec_view.append(module(x_sec_view, out_sec_view))
+                else:  # run module directly, i.e. mtype = 'convolutional', 'upsample', 'maxpool', 'batchnorm2d' etc.
+                    x_sec_view = module(x_sec_view)
+
+                # out_sec_view.append(x_sec_view if self.routs_sub[i] else [])
+                out_sec_view.append(x_sec_view if self.routs[i] else [])
+                if verbose:
+                    print('%g/%g %s -' % (i, len(self.module_list_sub), name), list(x_sec_view.shape), str)
+                    str = ''
 
         for i, module in enumerate(self.module_list):
             name = module.__class__.__name__
@@ -388,7 +523,12 @@ class Darknet(nn.Module):
                     l = [i - 1] + module.layers  # layers
                     sh = [list(x.shape)] + [list(out[i].shape) for i in module.layers]  # shapes
                     str = ' >> ' + ' + '.join(['layer %g %s' % x for x in zip(l, sh)])
-                x = module(x, out)  # WeightedFeatureFusion(), FeatureConcat()
+                if name == 'FeatureConcat':
+                    # x = module(x, out, out_sec_view, H_img_bev)    # FeatureConcat()
+                    x = module(x, out, out_sec_view, H_img_bev, writer)    # VISMODE1113 add writer
+                else:
+                    x = module(x, out)  # WeightedFeatureFusion()
+
             elif name == 'YOLOLayer':
                 yolo_out.append(module(x, out))
             else:  # run module directly, i.e. mtype = 'convolutional', 'upsample', 'maxpool', 'batchnorm2d' etc.
@@ -427,7 +567,21 @@ class Darknet(nn.Module):
                 if self.rotated:
                 # if x[1].shape[-1] == 87: ### check rotated flag
                     x[1][..., 4] = - x[1][..., 4] # flip lr for the eigen-vector embedding the direction of the box
+                    ### TODO: check rotated_anchor here
+                    if self.tail:
+                        if self.rotated_anchor:
+                            x[1][..., 5:7] /= s[0]
+                            x[1][..., 5] = - x[1][..., 5]
+                        else:
+                            x[1][..., 6:8] /= s[0]
+                            x[1][..., 6] = - x[1][..., 6]
+                        
                 x[2][..., :4] /= s[1]  # scale
+                if self.tail:
+                    if self.rotated_anchor:
+                        x[2][..., 5:7] /= s[1]
+                    else:
+                        x[2][..., 6:8] /= s[1]
 
                 x = torch.cat(x, 1)
             return x, p
