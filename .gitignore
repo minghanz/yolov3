@@ -19,7 +19,7 @@
 *.avi
 *.data
 *.json
-!detection_example_wide.png
+!detection_example*.png
 
 *.txt
 !dataset_format.txt

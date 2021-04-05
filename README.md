@@ -1,4 +1,4 @@
-![Detection example](detection_example_wide.png)
+![Detection example](detection_example.png)
 # Introduction
 
 This directory contains the detection part of the code for the paper [**Monocular 3D Vehicle Detection Using Uncalibrated Traffic Cameras through Homography**](https://arxiv.org/pdf/2103.15293.pdf). It is developed based on the yolov3 [repo](https://github.com/ultralytics/yolov3) by Ultralytics. 
