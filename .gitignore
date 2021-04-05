@@ -21,6 +21,7 @@
 *.json
 
 *.txt
+!dataset_format.txt
 events.*
 
 *.cfg

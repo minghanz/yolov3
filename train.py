@@ -659,7 +659,7 @@ def train(hyp):
                                       dual_view=dual_view, 
                                       use_mask=use_mask, 
                                       giou_loss=opt.giou_loss, 
-                                      riou=opt.riou)
+                                      riou_eval=opt.riou_eval)
 
         # Write
         ### s is from training, as an updated average of the whole epoch
@@ -760,11 +760,12 @@ if __name__ == '__main__':
     parser.add_argument('--dual-view', action='store_true', help='use both bev and original view as input')
     parser.add_argument('--use-mask', action='store_true', help='use invalid region mask to mask out some regions (do not want detections there)')
     parser.add_argument('--giou-loss', action='store_true', help='use giou in loss function')
-    parser.add_argument('--riou', action='store_true', help='use riou threshold in quantitative evaluation')
+    parser.add_argument('--riou-eval', action='store_true', help='use riou threshold in quantitative evaluation')
     
     opt = parser.parse_args()
     opt.weights = last if opt.resume else opt.weights
     check_git_status()
+    opt = choose_cfg_by_args(opt)
     opt.cfg = list(glob.iglob('./**/' + opt.cfg, recursive=True))[0]  # find file
     # opt.data = list(glob.iglob('./**/' + opt.data, recursive=True))[0]  # find file
     print(opt)

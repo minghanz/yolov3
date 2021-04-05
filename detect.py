@@ -286,6 +286,7 @@ if __name__ == '__main__':
     parser.add_argument('--dual-view', action='store_true', help='use both bev and original view as input')
     parser.add_argument('--use-mask', action='store_true', help='use invalid region mask to mask out some regions (do not want detections there)')
     opt = parser.parse_args()
+    opt = choose_cfg_by_args(opt)
     opt.cfg = list(glob.iglob('./**/' + opt.cfg, recursive=True))[0]  # find file
     opt.names = list(glob.iglob('./**/' + opt.names, recursive=True))[0]  # find file
     print(opt)

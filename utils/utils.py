@@ -775,11 +775,11 @@ def build_targets(p, targets, model, half_angle, tail_inv):
                 if half_angle:
                     # whiou = wh_iou(anchors[:, :2], t[:, 4:6]) #> model.hyp['iou_t']  # iou(3,n) = wh_iou(anchors(3,2), gwh(n,2))
                     # j = whiou > model.hyp['iou_t']      ### a bool matrix of na(3)*nt
-                    riou = r_align(anchors[:, 2], t[:, 6])
-                    j = torch.abs(riou) > 0.71                      ### 08162020: 0.707 -> pi/4
+                    angle_cos = r_align(anchors[:, 2], t[:, 6])
+                    j = torch.abs(angle_cos) > 0.71                      ### 08162020: 0.707 -> pi/4
                 else:
-                    riou = r_align(anchors[:, 2], t[:, 6])
-                    j = riou > 0.1                      ### 08162020: slightly larger than 0 to avoid dead lock
+                    angle_cos = r_align(anchors[:, 2], t[:, 6])
+                    j = angle_cos > 0.1                      ### 08162020: slightly larger than 0 to avoid dead lock
             a, t = at[j], t.repeat(na, 1, 1)[j]  # filter
             ### a is n_filtered index, and t is now n_filtered * 6 or 7 matrix, both are in terms of n*m
 
@@ -1766,3 +1766,21 @@ def plot_results(start=0, stop=0, bucket='', id=()):  # from utils.utils import 
     ax[1].legend()
     # fig.savefig('results.png', dpi=200)
     fig.savefig('results.png', dpi=100)
+
+def choose_cfg_by_args(args):
+    """
+    Set opt.cfg according to other options, so that when running the program, you do not need to specify the cfg file to use manually. 
+    """
+
+    assert "yolov3-spp" in args.cfg, "Only yolov3-spp*.cfg is tested with rotated bounding box detection. Now {} is given".format(args.cfg)
+    args.cfg = "yolov3-spp"
+    if args.rotated_anchor:
+        args.cfg += "-rbox"
+    if args.tail:
+        args.cfg += "tt"
+    if args.dual_view:
+        args.cfg += "dv"
+    if args.half_angle:
+        args.cfg += "180"
+    args.cfg += ".cfg"
+    return args

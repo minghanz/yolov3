@@ -1,0 +1,14 @@
+├── images
+│   ├── bev [dir]
+│   └── ori [dir]
+├── videos (optional, for inference)
+│   ├── bev.avi
+│   └── ori.avi
+├── masks (optional, needed if --use-mask is set)
+│   ├── bev_invalid_label_region.png
+├── labels
+│   ├── rbox_coco [dir]
+│   └── rboxtt_coco [dir]
+└── splits
+    ├── test.txt
+    └── train.txt

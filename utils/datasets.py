@@ -180,7 +180,6 @@ class LoadImages:  # for inference
 
         ### for dual_view, preload all calibs and bspecs
         if self.dual_view_first or self.dual_view_second:
-            root_path = "/media/sda1/datasets/extracted/roadmanship_format"
 
             if "CARLA" in path:
                 match = re.search("trial_c\d+_\d+", path)
@@ -820,7 +819,6 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
 
             ### for dual_view, preload all calibs and bspecs
             if self.dual_view_first or self.dual_view_second:
-                root_path = "/media/sda1/datasets/extracted/roadmanship_format"
 
                 if "CARLA" in self.img_files[index]:
                     match = re.search("trial_c\d+_\d+", self.img_files[index])

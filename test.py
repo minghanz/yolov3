@@ -31,7 +31,7 @@ def test(cfg,
          tail_inv=False, 
          dual_view=False, 
          use_mask=False, 
-         riou=False, 
+         riou_eval=False, 
          giou_loss=False):
     ### opt is accessible only when called in this script itself, where opt is declared outside of functions, therefore a global variable
     ### you are also able to change members in opt, since opt is a mutable object. You cannot modify an immutable object as a global variable in a function, except you declare it as global first in the function. 
@@ -232,7 +232,7 @@ def test(cfg,
                         if not rotated:
                             ious, i = box_iou(pred[pi, :4], tbox[ti]).max(1)  # best ious, indices
                         else:
-                            if riou:
+                            if riou_eval:
                                 # ious, i = d3d.box.box2d_iou(pred[pi, :5], tbox[ti], method="rbox").max(1)
                                 pred_d3d = pred[pi, :5].clone()
                                 pred_d3d[:,4] = -pred_d3d[:,4]
@@ -397,17 +397,18 @@ if __name__ == '__main__':
     parser.add_argument('--tail-inv', action='store_true', help='predict tail along with rbox, with the xy origin at the end of tail')
     parser.add_argument('--dual-view', action='store_true', help='use both bev and original view as input')
     parser.add_argument('--use-mask', action='store_true', help='use invalid region mask to mask out some regions (do not want detections there)')
-    parser.add_argument('--riou', action='store_true', help='use riou threshold in quantitative evaluation')
+    parser.add_argument('--riou-eval', action='store_true', help='use riou threshold in quantitative evaluation')
     parser.add_argument('--giou-loss', action='store_true', help='use giou in loss function')
     opt = parser.parse_args()
     opt.save_json = opt.save_json or any([x in opt.data for x in ['coco.data', 'coco2014.data', 'coco2017.data']])
+    opt = choose_cfg_by_args(opt)
     opt.cfg = list(glob.iglob('./**/' + opt.cfg, recursive=True))[0]  # find file
     # opt.data = list(glob.iglob('./**/' + opt.data, recursive=True))[0]  # find file
     print(opt)
 
     ### save arguments to file
     if opt.save_txt:
-        if opt.riou:
+        if opt.riou_eval:
             output_path = "results/riou_test_result_d_{}_w_{}.txt".format(opt.data.split("/")[-1].split(".")[0], opt.weights.split("/")[-1].split(".")[0])
         else:
             output_path = "results/liou_test_result_d_{}_w_{}.txt".format(opt.data.split("/")[-1].split(".")[0], opt.weights.split("/")[-1].split(".")[0])
@@ -439,7 +440,7 @@ if __name__ == '__main__':
              tail_inv=opt.tail_inv, 
              dual_view=opt.dual_view, 
              use_mask=opt.use_mask, 
-             riou=opt.riou, 
+             riou_eval=opt.riou_eval, 
              giou_loss=opt.giou_loss)
 
     elif opt.task == 'benchmark':  # mAPs at 256-640 at conf 0.5 and 0.7
